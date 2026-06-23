@@ -1,0 +1,33 @@
+[project]
+name = "graphrag"
+version = "0.1.0"
+description = "개인용 단독 GraphRAG (컬렉션 격벽 + 통합 CLI)"
+requires-python = ">=3.12"
+# 의존성은 requirements.txt로 관리한다(pip install -r requirements.txt). 여기서는 CLI 진입점만 등록한다.
+
+[project.scripts]
+graphrag = "graphrag_cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# flat 레이아웃(루트에 모듈/패키지가 흩어져 있음)이라 자동탐색 대신 명시적으로 지정한다.
+[tool.setuptools]
+py-modules = [
+    "graphrag_cli",
+    "config",
+    "schemas",
+    "query",
+    "graph_export",
+    "graph_viz",
+    "backup_db",
+    "restore_db",
+    "cleanup_db",
+    "db_status",
+    "init_db",
+    "process_inbox",
+]
+
+[tool.setuptools.packages.find]
+include = ["db*", "pipeline*", "adapters*"]

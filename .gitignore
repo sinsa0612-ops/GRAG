@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+graphrag_dbs/
+.pytest_cache/
+backups/
+inbox/
+processed/
+failed/
+exports/
+.claude/
+
+# 빌드 산출물 (pip install -e . 가 생성)
+*.egg-info/
+
+# Claude Code 런타임 락 / 임시 QA 출력
+.claude/scheduled_tasks.lock
+qa_result.txt
