@@ -8,3 +8,5 @@ pydantic-settings==2.14.2
 pytest==9.1.1
 streamlit==1.58.0
 pyvis==0.3.2
+# Windows엔 IANA 타임존 DB가 없어, 사용량 집계를 태평양시간(Gemini 한도 리셋) 기준으로 맞추는 데 필요.
+tzdata==2026.2

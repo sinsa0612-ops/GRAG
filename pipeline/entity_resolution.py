@@ -29,8 +29,8 @@ def find_merge_candidates(collection: str) -> list[tuple[str, str, float]]:
             if score <= settings.merge_similarity_threshold:
                 continue
             name_a, name_b = entities[i]["name"], entities[j]["name"]
-            if sqlite_manager.is_merge_blacklisted(name_a, name_b):
-                logger.info("병합 예외 규칙 적용됨: %s / %s", name_a, name_b)
+            if sqlite_manager.is_merge_blacklisted(collection, name_a, name_b):
+                logger.info("병합 예외 규칙 적용됨[%s]: %s / %s", collection, name_a, name_b)
                 continue
             candidates.append((name_a, name_b, float(score)))
     return candidates

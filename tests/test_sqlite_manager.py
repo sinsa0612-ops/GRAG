@@ -15,11 +15,20 @@ def test_document_hash_roundtrip():
 
 def test_merge_blacklist_is_order_independent():
     sqlite_manager.init_schema()
-    sqlite_manager.add_merge_blacklist("애플", "Apple", "다른 의미")
+    sqlite_manager.add_merge_blacklist(C, "애플", "Apple", "다른 의미")
 
-    assert sqlite_manager.is_merge_blacklisted("애플", "Apple") is True
-    assert sqlite_manager.is_merge_blacklisted("Apple", "애플") is True
-    assert sqlite_manager.is_merge_blacklisted("애플", "고양이") is False
+    assert sqlite_manager.is_merge_blacklisted(C, "애플", "Apple") is True
+    assert sqlite_manager.is_merge_blacklisted(C, "Apple", "애플") is True
+    assert sqlite_manager.is_merge_blacklisted(C, "애플", "고양이") is False
+
+
+def test_merge_blacklist_is_collection_scoped():
+    # 한 사업의 병합 금지 규칙이 다른 사업으로 새지 않아야 한다(격벽).
+    sqlite_manager.init_schema()
+    sqlite_manager.add_merge_blacklist("사업A", "애플", "Apple", "다른 의미")
+
+    assert sqlite_manager.is_merge_blacklisted("사업A", "애플", "Apple") is True
+    assert sqlite_manager.is_merge_blacklisted("사업B", "애플", "Apple") is False
 
 
 def test_delete_document_and_count():
@@ -77,13 +86,25 @@ def test_get_all_source_ids():
     assert sqlite_manager.get_all_source_ids() == {"doc_1", "doc_2"}
 
 
+def test_api_usage_accumulates_per_day():
+    sqlite_manager.init_schema()
+    assert sqlite_manager.get_api_usage_today() == 0
+
+    sqlite_manager.record_api_usage(91)
+    sqlite_manager.record_api_usage(9)
+    assert sqlite_manager.get_api_usage_today() == 100
+
+    sqlite_manager.record_api_usage(0)  # 0 이하는 무시
+    assert sqlite_manager.get_api_usage_today() == 100
+
+
 def test_list_and_remove_merge_blacklist():
     sqlite_manager.init_schema()
-    sqlite_manager.add_merge_blacklist("애플", "Apple", "다른 의미")
+    sqlite_manager.add_merge_blacklist(C, "애플", "Apple", "다른 의미")
 
     listed = sqlite_manager.list_merge_blacklist()
-    assert listed == [{"node_a": "애플", "node_b": "Apple", "reason": "다른 의미"}]
+    assert listed == [{"collection": C, "node_a": "애플", "node_b": "Apple", "reason": "다른 의미"}]
 
-    sqlite_manager.remove_merge_blacklist("Apple", "애플")
+    sqlite_manager.remove_merge_blacklist(C, "Apple", "애플")
     assert sqlite_manager.list_merge_blacklist() == []
-    assert sqlite_manager.is_merge_blacklisted("애플", "Apple") is False
+    assert sqlite_manager.is_merge_blacklisted(C, "애플", "Apple") is False

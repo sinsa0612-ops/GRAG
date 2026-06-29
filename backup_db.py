@@ -5,7 +5,7 @@ from pathlib import Path
 from shutil import make_archive
 
 from config import settings
-from db import graph_manager
+from db import graph_manager, vector_manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,10 +23,12 @@ def _prune_old_backups(backup_dir: Path, keep: int) -> None:
 
 
 # graphrag_dbs/ 전체를 zip으로 압축해 backups/ 아래 타임스탬프 이름으로 저장한다.
-# Kuzu 커넥션이 열려 있으면 Windows에서 파일 복사가 PermissionError로 막히므로, 먼저 닫는다.
+# Kuzu/Chroma 커넥션이 열려 있으면 Windows에서 파일 복사가 PermissionError로 막히고, Chroma는 쓰다 만
+# 상태(WAL)로 찍힐 수 있으므로 둘 다 먼저 닫는다.
 # 백업이 무한정 쌓이지 않도록, 저장 후 설정된 보관 개수(backup_keep)를 넘는 오래된 백업은 정리한다.
 def create_backup() -> Path:
     graph_manager.close_connection()
+    vector_manager.close()
 
     backup_dir = settings.project_root / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)

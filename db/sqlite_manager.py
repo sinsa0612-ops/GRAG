@@ -1,9 +1,25 @@
-# SQLite(Master DB) 전담 — 문서 원본/해시 및 병합 블랙리스트만 책임진다.
+# SQLite(Master DB) 전담 — 문서 원본/해시, 병합 블랙리스트, 일일 API 사용량을 책임진다.
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 
 from config import settings
+
+# Gemini 무료 한도는 태평양시간 자정에 리셋된다. 로컬 날짜로 세면 최대 17시간까지 어긋나므로 태평양 날짜로 집계한다.
+# (Windows엔 IANA tz DB가 없어 tzdata 패키지가 필요하다. 없으면 로컬 시간으로 안전하게 폴백한다.)
+try:
+    from zoneinfo import ZoneInfo
+
+    _PACIFIC: "ZoneInfo | None" = ZoneInfo("America/Los_Angeles")
+except Exception:
+    _PACIFIC = None
+
+
+# 사용량 집계에 쓸 '오늘' 날짜 문자열(태평양시간 기준, 폴백 시 로컬)을 만든다.
+def _usage_date() -> str:
+    now = datetime.now(_PACIFIC) if _PACIFIC else datetime.now()
+    return now.date().isoformat()
 
 
 # SQLite 커넥션을 열고 자동 commit/close까지 책임지는 컨텍스트 매니저.
@@ -39,13 +55,45 @@ def init_schema() -> None:
             conn.execute(
                 "ALTER TABLE documents ADD COLUMN collection TEXT NOT NULL DEFAULT 'default'"
             )
+        # 병합 금지 목록 — 컬렉션(사업)별로 격리한다. 같은 이름 쌍이라도 사업이 다르면 별개로 관리(격벽 유지).
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS merge_blacklist (
+                collection TEXT NOT NULL DEFAULT 'default',
                 node_a TEXT NOT NULL,
                 node_b TEXT NOT NULL,
                 reason TEXT,
-                PRIMARY KEY (node_a, node_b)
+                PRIMARY KEY (collection, node_a, node_b)
+            )
+            """
+        )
+        # 기존(컬렉션 도입 전) 블랙리스트엔 collection 컬럼이 없다. SQLite는 PK 변경이 불가하므로,
+        # 새 스키마 테이블에 데이터를 'default' 컬렉션으로 옮겨 담아 교체한다(자동 마이그레이션).
+        bl_cols = {row[1] for row in conn.execute("PRAGMA table_info(merge_blacklist)").fetchall()}
+        if "collection" not in bl_cols:
+            conn.execute("ALTER TABLE merge_blacklist RENAME TO merge_blacklist_old")
+            conn.execute(
+                """
+                CREATE TABLE merge_blacklist (
+                    collection TEXT NOT NULL DEFAULT 'default',
+                    node_a TEXT NOT NULL,
+                    node_b TEXT NOT NULL,
+                    reason TEXT,
+                    PRIMARY KEY (collection, node_a, node_b)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO merge_blacklist (collection, node_a, node_b, reason) "
+                "SELECT 'default', node_a, node_b, reason FROM merge_blacklist_old"
+            )
+            conn.execute("DROP TABLE merge_blacklist_old")
+        # 날짜별 LLM 요청 수를 누적 기록한다 (RPD 한도 예측·차단용).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_usage (
+                usage_date TEXT PRIMARY KEY,
+                request_count INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -133,6 +181,31 @@ def get_all_source_ids() -> set[str]:
     return {row[0] for row in rows}
 
 
+# 오늘 보낸 LLM 요청 수를 n만큼 누적 기록한다 (날짜는 태평양시간 기준 — Gemini 한도 리셋과 맞춤).
+def record_api_usage(n: int) -> None:
+    if n <= 0:
+        return
+    today = _usage_date()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO api_usage (usage_date, request_count) VALUES (?, ?)
+            ON CONFLICT(usage_date) DO UPDATE SET request_count = request_count + ?
+            """,
+            (today, n, n),
+        )
+
+
+# 오늘 누적된 LLM 요청 수를 조회한다 (없으면 0, 날짜는 태평양시간 기준).
+def get_api_usage_today() -> int:
+    today = _usage_date()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT request_count FROM api_usage WHERE usage_date = ?", (today,)
+        ).fetchone()
+    return row[0] if row else 0
+
+
 # 현재 SQLite에 기록된 모든 컬렉션 이름과 각 문서 수를 가져온다 (컬렉션 목록 조회용).
 def get_collection_doc_counts() -> dict[str, int]:
     with get_connection() as conn:
@@ -142,42 +215,53 @@ def get_collection_doc_counts() -> dict[str, int]:
     return {row[0]: row[1] for row in rows}
 
 
-# 두 노드가 병합 금지 목록에 있는지 확인한다 (순서 무관).
-def is_merge_blacklisted(node_a: str, node_b: str) -> bool:
+# 두 노드가 해당 컬렉션의 병합 금지 목록에 있는지 확인한다 (순서 무관).
+def is_merge_blacklisted(collection: str, node_a: str, node_b: str) -> bool:
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT 1 FROM merge_blacklist
-            WHERE (node_a = ? AND node_b = ?) OR (node_a = ? AND node_b = ?)
+            WHERE collection = ?
+              AND ((node_a = ? AND node_b = ?) OR (node_a = ? AND node_b = ?))
             """,
-            (node_a, node_b, node_b, node_a),
+            (collection, node_a, node_b, node_b, node_a),
         ).fetchone()
     return row is not None
 
 
-# 두 노드를 병합 금지 목록에 추가한다.
-def add_merge_blacklist(node_a: str, node_b: str, reason: str = "") -> None:
+# 두 노드를 해당 컬렉션의 병합 금지 목록에 추가한다.
+def add_merge_blacklist(collection: str, node_a: str, node_b: str, reason: str = "") -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO merge_blacklist (node_a, node_b, reason) VALUES (?, ?, ?)",
-            (node_a, node_b, reason),
+            "INSERT OR IGNORE INTO merge_blacklist (collection, node_a, node_b, reason) "
+            "VALUES (?, ?, ?, ?)",
+            (collection, node_a, node_b, reason),
         )
 
 
-# 병합 금지 목록 전체를 조회한다.
-def list_merge_blacklist() -> list[dict]:
+# 병합 금지 목록을 조회한다 (collection을 주면 그 사업 범위만, None이면 전체).
+def list_merge_blacklist(collection: str | None = None) -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute("SELECT node_a, node_b, reason FROM merge_blacklist").fetchall()
-    return [{"node_a": r[0], "node_b": r[1], "reason": r[2]} for r in rows]
+        if collection is None:
+            rows = conn.execute(
+                "SELECT collection, node_a, node_b, reason FROM merge_blacklist"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT collection, node_a, node_b, reason FROM merge_blacklist WHERE collection = ?",
+                (collection,),
+            ).fetchall()
+    return [{"collection": r[0], "node_a": r[1], "node_b": r[2], "reason": r[3]} for r in rows]
 
 
-# 병합 금지 목록에서 두 노드 쌍을 제거한다 (순서 무관).
-def remove_merge_blacklist(node_a: str, node_b: str) -> None:
+# 해당 컬렉션의 병합 금지 목록에서 두 노드 쌍을 제거한다 (순서 무관).
+def remove_merge_blacklist(collection: str, node_a: str, node_b: str) -> None:
     with get_connection() as conn:
         conn.execute(
             """
             DELETE FROM merge_blacklist
-            WHERE (node_a = ? AND node_b = ?) OR (node_a = ? AND node_b = ?)
+            WHERE collection = ?
+              AND ((node_a = ? AND node_b = ?) OR (node_a = ? AND node_b = ?))
             """,
-            (node_a, node_b, node_b, node_a),
+            (collection, node_a, node_b, node_b, node_a),
         )

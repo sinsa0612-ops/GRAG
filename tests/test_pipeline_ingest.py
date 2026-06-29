@@ -185,8 +185,10 @@ def test_process_file_refreshes_vocabulary_between_chunks(tmp_path, monkeypatch)
     ingest.process_file(file_path, C)
 
     assert len(captured_prompts) >= 2
+    # 첫 청크(강택리를 만들기 전)엔 힌트가 없고, 그 이후 같은 이름을 언급하는 청크엔 힌트가 보여야 한다.
+    # (문장 경계 청킹에선 같은 이름이 등장하는 '후속' 청크가 정확히 두 번째가 아닐 수 있어 인덱스를 고정하지 않는다.)
     assert "기존 엔티티 이름: 강택리" not in captured_prompts[0]
-    assert "기존 엔티티 이름: 강택리" in captured_prompts[1]
+    assert any("기존 엔티티 이름: 강택리" in p for p in captured_prompts[1:])
 
 
 def test_resolve_canonical_name_routes_alias_to_existing_entity():

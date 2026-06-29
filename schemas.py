@@ -1,4 +1,5 @@
 # LLM 추출 결과를 DB에 넣기 전 검증하는 Pydantic 스키마 (입구 검증 전용).
+import re
 from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
@@ -41,6 +42,16 @@ class ExtractedRelation(BaseModel):
     target: str = Field(min_length=1)
     predicate: str = Field(min_length=1)
     valid_from: str = ""
+
+    @field_validator("predicate", mode="before")
+    @classmethod
+    # predicate 표기를 대문자 스네이크케이스로 통일한다(works at / Works-At -> WORKS_AT).
+    # 같은 뜻의 관계가 표기 차이만으로 파편화되는 것을 입구에서부터 막는다(어휘 안정화).
+    def _normalize_predicate(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        collapsed = re.sub(r"[\s\-]+", "_", value.strip())
+        return re.sub(r"_+", "_", collapsed).strip("_").upper()
 
 
 # LLM 추출 응답 전체(엔티티 목록 + 관계 목록)를 표현한다.

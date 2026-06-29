@@ -1,7 +1,15 @@
 # 문서 저장 오케스트레이션(document_store)이 해시 비교/청킹/교체 흐름을 올바르게 수행하는지 검증한다.
+from config import settings
 from db import document_store, graph_manager, sqlite_manager, vector_manager
 
 C = "c1"
+
+
+def test_estimate_request_count_equals_chunk_count(monkeypatch):
+    # 예상 요청 수 = 청크 수 (RPD 한도 예측의 근거).
+    monkeypatch.setattr(settings, "chunk_size", 10)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+    assert document_store.estimate_request_count("가" * 25) == 3
 
 
 def test_compute_hash_is_deterministic():
@@ -34,6 +42,16 @@ def test_chunk_text_merge_guard_preserves_full_content():
     assert all(len(c) > 200 for c in chunks)
     assert "".join(chunks)[-1] == content[-1]
     assert chunks[0][0] == content[0]
+
+
+def test_chunk_text_prefers_sentence_boundaries():
+    # 경계가 있는 글은 문장 한가운데가 아니라 문장부호 뒤에서 잘려야 한다(추출 품질).
+    content = "첫 문장이다. 두 번째 문장이다. 세 번째 문장이다."
+    chunks = document_store.chunk_text(content, chunk_size=20, overlap=0)
+
+    assert len(chunks) >= 2
+    assert "".join(chunks) == content  # overlap=0이면 글자 손실 없이 원문이 복원된다
+    assert chunks[0].rstrip().endswith(".")  # 첫 청크가 문장 끝에서 마무리됨
 
 
 def test_needs_processing_detects_change():

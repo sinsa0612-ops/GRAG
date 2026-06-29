@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from adapters.llm_adapter import generate
 from config import settings
-from db import document_store, graph_manager, vector_manager
+from db import document_store, graph_manager, sqlite_manager, vector_manager
 from schemas import EntityType, ExtractionResult
 
 logger = logging.getLogger(__name__)
@@ -15,14 +15,32 @@ logger = logging.getLogger(__name__)
 # 엔티티 type을 고정 온톨로지로 가두기 위해 허용 목록을 프롬프트에 직접 명시한다(schemas.EntityType와 단일 출처).
 _ALLOWED_TYPES = ", ".join(t.value for t in EntityType)
 
+# 자주 쓰는 관계 이름 시드 목록. type처럼 강제하지는 않고(열린 어휘), '가능하면 이것부터 재사용'하도록 권장만 한다.
+# 초기 문서들이 같은 관계를 제각각(WORKS_AT/EMPLOYED_BY/...)으로 만들어 파편화되는 것을 줄인다.
+_SEED_PREDICATES = ", ".join(
+    [
+        "WORKS_AT", "MEMBER_OF", "PART_OF", "LOCATED_IN", "OWNS", "MANAGES",
+        "CREATED", "PRODUCES", "USES", "PARTICIPATED_IN", "OCCURRED_ON",
+        "HAS_ROLE", "AFFILIATED_WITH", "CAUSES", "RELATED_TO",
+    ]
+)
+
 _EXTRACTION_PROMPT = """\
 다음 텍스트에서 중요한 엔티티(명사)와 관계를 추출해.
 동명이인 구분을 위해 description을 꼭 적어줘.
 엔티티 type은 반드시 아래 목록 중 하나만 대문자 그대로 골라. 애매하면 OTHER로 둬:
 {allowed_types}
 관계 predicate는 항상 영어 대문자 스네이크케이스로만 적어(한글 금지. 예: WORKS_AT, LOCATED_IN).
+가능하면 아래 자주 쓰는 관계를 먼저 재사용하고, 정말 맞는 게 없을 때만 같은 형식으로 새로 만들어:
+{seed_predicates}
 valid_from처럼 날짜/시점 정보는 텍스트에 명시적으로 적혀 있을 때만 채우고,
 적혀 있지 않으면 절대 추측하지 말고 빈 문자열("")로 남겨줘.
+
+예시)
+입력: "홍길동은 2020년부터 OO전자에 다녔다."
+출력: {{"entities": [{{"name": "홍길동", "type": "PERSON", "description": "OO전자 직원"}}, \
+{{"name": "OO전자", "type": "ORGANIZATION", "description": "홍길동이 다닌 회사"}}], \
+"relations": [{{"source": "홍길동", "target": "OO전자", "predicate": "WORKS_AT", "valid_from": "2020"}}]}}
 
 텍스트:
 {chunk}
@@ -54,7 +72,9 @@ def _build_prompt(
             names=", ".join(relevant_names) or "(아직 없음)",
             predicates=", ".join(known_predicates) or "(아직 없음)",
         )
-    return vocab_hint + _EXTRACTION_PROMPT.format(allowed_types=_ALLOWED_TYPES, chunk=chunk)
+    return vocab_hint + _EXTRACTION_PROMPT.format(
+        allowed_types=_ALLOWED_TYPES, seed_predicates=_SEED_PREDICATES, chunk=chunk
+    )
 
 
 # LLM 원시 응답 문자열을 파싱하고 Pydantic으로 검증한다 (입구 검증).
@@ -128,6 +148,8 @@ def process_file(file_path: Path, collection: str) -> bool:
 
     source_id = document_store.prepare_replacement(file_name)
     chunks = document_store.chunk_text(content, settings.chunk_size, settings.chunk_overlap)
+    # 청크마다 LLM 호출 1번이 나가므로, 청크 수만큼 오늘 사용량에 기록한다(RPD 추적).
+    sqlite_manager.record_api_usage(len(chunks))
     vector_manager.add_chunks(source_id, chunks, collection)
 
     for chunk in chunks:

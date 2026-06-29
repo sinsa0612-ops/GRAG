@@ -1,8 +1,10 @@
 # 문서 단위 저장 오케스트레이션 — sqlite/vector/graph 호출 순서만 정하는 얇은 계층.
 import hashlib
 import logging
+import re
 import time
 
+from config import settings
 from db import graph_manager, sqlite_manager, vector_manager
 
 logger = logging.getLogger(__name__)
@@ -13,18 +15,76 @@ def compute_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-# 문서를 일정 길이로 분할한다. overlap만큼 겹쳐 잘라 경계에서 끊긴 문맥(관계)을 보존한다.
-# 마지막 청크가 overlap 이하로 작으면(= 내용 전부가 이전 청크와 중복) 따로 떼지 않고
-# 이전 청크에 흡수시켜, 의미 없는 초소형 청크가 LLM 호출을 낭비하지 않게 한다.
-def chunk_text(content: str, chunk_size: int, overlap: int = 0) -> list[str]:
-    step = chunk_size - overlap
-    starts = list(range(0, len(content), step))
-    chunks = [content[i : i + chunk_size] for i in starts]
+# 문장/문단 경계를 우선해 자르기 위한 구분자 우선순위.
+# 위에서부터 차례로 시도하고, 어떤 것도 안 통하면 최후에 글자 단위(None)로 쪼갠다.
+# 문장 구분자는 문장부호 뒤 공백을 노려, 문장부호 자체는 앞 문장에 남겨 보존한다.
+_CHUNK_SEPARATORS = [
+    r"\n\s*\n",  # 문단 경계(빈 줄)
+    r"\n",  # 줄 경계
+    r"[.!?。?！][\s\"'”’)\]]*\s+",  # 문장 경계(문장부호 + 따라오는 닫는 따옴표/공백)
+    r"\s+",  # 공백 경계
+    None,  # 최후: 글자 단위
+]
 
-    if len(chunks) > 1 and len(chunks[-1]) <= overlap:
-        chunks = chunks[:-2] + [content[starts[-2] :]]
 
+# 구분자를 '앞 조각'에 그대로 붙여 자른다(어떤 글자도 잃지 않게).
+def _split_keep(text: str, pattern: str) -> list[str]:
+    pieces: list[str] = []
+    last = 0
+    for match in re.finditer(pattern, text):
+        pieces.append(text[last : match.end()])
+        last = match.end()
+    if last < len(text):
+        pieces.append(text[last:])
+    return pieces
+
+
+# 텍스트를 chunk_size 이하의 의미 단위(원자)들로 쪼갠다.
+# 구분자 우선순위를 따라 내려가며, 한 조각이 여전히 너무 길면 더 잘게(다음 구분자로) 재귀 분할한다.
+def _atomize(text: str, chunk_size: int, separators: list) -> list[str]:
+    if len(text) <= chunk_size:
+        return [text] if text else []
+    if not separators or separators[0] is None:
+        return list(text)  # 더 쪼갤 경계가 없으면 글자 단위로(겹침 계산이 정확해진다)
+    pieces = _split_keep(text, separators[0])
+    if len(pieces) <= 1:
+        return _atomize(text, chunk_size, separators[1:])
+    atoms: list[str] = []
+    for piece in pieces:
+        atoms.extend(_atomize(piece, chunk_size, separators[1:]))
+    return atoms
+
+
+# 의미 단위(원자)들을 chunk_size를 넘지 않게 이어붙이고, 경계마다 overlap만큼 겹쳐 다음 청크로 넘긴다.
+def _merge_atoms(atoms: list[str], chunk_size: int, overlap: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    total = 0
+    for atom in atoms:
+        if total + len(atom) > chunk_size and current:
+            chunks.append("".join(current))
+            while total > overlap and current:  # 앞쪽을 덜어 겹침 분량만 남긴다
+                total -= len(current[0])
+                current.pop(0)
+        current.append(atom)
+        total += len(atom)
+    if current:
+        chunks.append("".join(current))
     return chunks
+
+
+# 문서를 분할한다. 문단/문장/공백 경계를 우선해 잘라 문맥(관계)이 문장 한가운데서 끊기지 않게 하고,
+# overlap만큼 겹쳐 경계에 걸친 관계도 보존한다. 자를 경계가 전혀 없으면 글자 단위로 폴백한다.
+def chunk_text(content: str, chunk_size: int, overlap: int = 0) -> list[str]:
+    if not content:
+        return []
+    atoms = _atomize(content, chunk_size, _CHUNK_SEPARATORS)
+    return _merge_atoms(atoms, chunk_size, overlap)
+
+
+# 이 문서를 처리할 때 나갈 LLM 요청 수(= 청크 수)를 미리 계산한다 (RPD 한도 예측용).
+def estimate_request_count(content: str) -> int:
+    return len(chunk_text(content, settings.chunk_size, settings.chunk_overlap))
 
 
 # 저장된 해시와 비교해 재처리가 필요한지 판단한다 (해당 컬렉션 범위에서).

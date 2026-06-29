@@ -19,6 +19,20 @@ def _get_collection():
     )
 
 
+# 열려 있는 Chroma 클라이언트를 해제한다. 백업/복원처럼 graphrag_dbs/를 통째로 복사·교체하기 전에 호출해,
+# Chroma 내부 SQLite가 쓰다 만 상태(WAL)로 복사되거나 Windows에서 파일 락이 걸리는 것을 막는다.
+# 다음 DB 접근 시 _get_collection()이 자동으로 다시 연다.
+def close() -> None:
+    global _client
+    _client = None
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+
+        SharedSystemClient.clear_system_cache()  # 내부 캐시까지 비워 SQLite 커넥션을 실제로 닫는다
+    except Exception:
+        pass
+
+
 # knowledge_chunks 컬렉션을 최초 1회 생성한다.
 def init_schema() -> None:
     _get_collection()
@@ -58,9 +72,13 @@ def query_similar(text: str, top_k: int = 5, collections: list[str] | None = Non
     return documents[0]
 
 
-# 전체 청크 개수를 센다 (상태 확인용).
-def count_chunks() -> int:
-    return _get_collection().count()
+# 청크 개수를 센다 (상태 확인용). collections를 주면 그 컬렉션(사업) 범위만, None이면 전체를 센다.
+def count_chunks(collections: list[str] | None = None) -> int:
+    collection = _get_collection()
+    if collections is None:
+        return collection.count()
+    result = collection.get(where={"collection": {"$in": collections}}, include=[])
+    return len(result.get("ids") or [])
 
 
 # 현재 컬렉션에 들어있는 모든 source_id를 가져온다 (고아 데이터 탐지용).

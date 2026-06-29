@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from config import settings
-from db import graph_manager
+from db import graph_manager, vector_manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ def restore_backup(archive_path: Path) -> None:
 
     # 2) 풀기에 성공했을 때만 기존 DB를 옆으로 치우고 새 DB를 제자리에 놓는다(폴더 rename은 순간적).
     graph_manager.close_connection()
+    vector_manager.close()
     if old_dir.exists():
         shutil.rmtree(old_dir)
     try:

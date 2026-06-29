@@ -20,3 +20,16 @@ def test_count_chunks_and_get_all_source_ids(monkeypatch):
 
     # 컬렉션 필터로 검색 범위를 좁히면 그 컬렉션의 청크만 후보가 된다.
     assert vector_manager.query_similar("쿼리", top_k=5, collections=["c2"]) == ["청크 C"]
+
+
+def test_count_chunks_respects_collection_scope(monkeypatch):
+    # status가 컬렉션 범위를 지정하면 청크 수도 그 사업만 세어야 한다(다른 집계와 숫자 일치).
+    monkeypatch.setattr("db.vector_manager.embed_texts", _fake_embed_texts)
+
+    vector_manager.add_chunks("doc_1", ["청크 A", "청크 B"], "c1")
+    vector_manager.add_chunks("doc_2", ["청크 C"], "c2")
+
+    assert vector_manager.count_chunks() == 3
+    assert vector_manager.count_chunks(["c1"]) == 2
+    assert vector_manager.count_chunks(["c2"]) == 1
+    assert vector_manager.count_chunks(["c1", "c2"]) == 3

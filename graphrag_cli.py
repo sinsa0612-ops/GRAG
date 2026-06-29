@@ -2,6 +2,7 @@
 # 각 서브커맨드는 기존 모듈 함수를 그대로 호출한다. 컬렉션(사업) 범위는 --collection / --all 로 지정한다.
 import argparse
 import logging
+import math
 import shutil
 from pathlib import Path
 
@@ -32,26 +33,95 @@ def cmd_init(args) -> None:
     print("DB 초기화 완료" + (" (기존 데이터 리셋됨)" if args.reset else ""))
 
 
+# 처리 도중 끊긴 고아 데이터(어느 문서에도 속하지 않는 청크/관계)를 자동 정리하고, 있으면 알려준다.
+def _report_orphan_cleanup() -> None:
+    from db import document_store
+
+    removed = document_store.cleanup_orphaned_data()
+    if removed:
+        print(f"고아 데이터 {removed}건 자동 정리됨")
+
+
+# 한도 초과로 차단됐을 때, 문서를 몇 개로 쪼개야 하는지 안내한다.
+def _print_split_guidance(estimates: list[tuple], remaining: int, limit: int) -> None:
+    step = max(1, settings.chunk_size - settings.chunk_overlap)
+    for path, n in estimates:
+        if n > limit:
+            pieces = math.ceil(n / limit)
+            approx_chars = limit * step
+            print(
+                f"  · {path.name}({n}청크)는 하루 한도({limit})를 단독으로 넘습니다 "
+                f"→ 약 {pieces}개로 나눠 각각 넣으세요 (조각당 ≤{limit}청크 ≈ ≤약 {approx_chars:,}자)."
+            )
+            print(f"    예: {path.stem}-1{path.suffix}, {path.stem}-2{path.suffix} ...")
+    if remaining > 0:
+        print(f"  · 오늘 남은 한도는 {remaining}요청입니다. 합계가 이보다 작아지게 나누거나 내일 이어서 하세요.")
+    else:
+        print("  · 오늘 한도를 이미 다 썼습니다. 내일(태평양시간 자정 리셋) 다시 시도하세요.")
+
+
 # 파일들(또는 inbox/ 전체)을 지정한 컬렉션으로 추출·저장한다.
-# 파일을 직접 지정한 경우에도 inbox와 똑같이, 처리 후 원본을 컬렉션별 분류 폴더로 옮긴다
-# (성공 → processed/<컬렉션>/, 실패 → failed/<컬렉션>/).
+# 처리 전에 예상 요청 수(=청크 수)와 오늘 사용량을 비교해, 하루 한도를 넘기면 차단하고 분할을 안내한다.
+# 파일을 직접 지정한 경우에도 inbox와 똑같이, 처리 후 원본을 컬렉션별 분류 폴더로 옮긴다.
 def cmd_ingest(args) -> None:
+    from db import document_store, sqlite_manager
     from pipeline import ingest
 
     import process_inbox
 
     collection = args.collection or settings.default_collection
+
+    # 1) 처리 대상 파일 목록 결정
+    if args.inbox:
+        settings.inbox_dir.mkdir(parents=True, exist_ok=True)
+        targets = sorted(p for p in settings.inbox_dir.iterdir() if p.is_file())
+    else:
+        if not args.files:
+            print("처리할 파일을 지정하거나 --inbox 를 쓰세요.")
+            return
+        targets = []
+        for f in args.files:
+            path = Path(f)
+            if not path.exists():
+                print(f"파일을 찾을 수 없습니다: {f}")
+                continue
+            targets.append(path)
+    if not targets:
+        print("처리할 파일이 없습니다.")
+        return
+
+    # 2) 예상 요청 수(=청크 수)와 오늘 사용량 비교
+    estimates = [
+        (path, document_store.estimate_request_count(path.read_text(encoding="utf-8")))
+        for path in targets
+    ]
+    total_est = sum(n for _, n in estimates)
+    used = sqlite_manager.get_api_usage_today()
+    limit = settings.llm_daily_limit
+    remaining = limit - used
+
+    print(f"오늘 사용: {used}/{limit} (남은 한도 {max(0, remaining)})")
+    for path, n in estimates:
+        print(f"  - {path.name}: 예상 {n} 요청")
+    print(f"이번 작업 합계: {total_est} 요청 → 처리 후 {used + total_est}/{limit}")
+
+    if args.dry_run:
+        print("(--dry-run: 실제 처리는 하지 않았습니다)")
+        return
+
+    # 3) 한도 가드
+    if used + total_est > limit and not args.force:
+        print(f"\n⛔ 한도 초과 예상: {used} + {total_est} = {used + total_est} > {limit}  — 처리를 중단합니다.")
+        _print_split_guidance(estimates, max(0, remaining), limit)
+        print("그래도 강행하려면 --force 를 붙이세요.")
+        return
+
+    # 4) 실제 처리
     if args.inbox:
         process_inbox.process_inbox(collection)
+        _report_orphan_cleanup()
         return
-    if not args.files:
-        print("처리할 파일을 지정하거나 --inbox 를 쓰세요.")
-        return
-    for f in args.files:
-        path = Path(f)
-        if not path.exists():
-            print(f"파일을 찾을 수 없습니다: {f}")
-            continue
+    for path, _ in estimates:
         try:
             changed = ingest.process_file(path, collection)
         except Exception as exc:
@@ -65,6 +135,16 @@ def cmd_ingest(args) -> None:
         shutil.move(str(path), process_inbox._unique_destination(processed_dir, path.name))
         status = "처리 완료" if changed else "변경 없음(이미 처리됨)"
         print(f"[{collection}] {path.name}: {status} — processed/{collection}/로 이동")
+    _report_orphan_cleanup()
+
+
+# 오늘 LLM 요청 사용량과 남은 한도를 출력한다.
+def cmd_usage(args) -> None:
+    from db import sqlite_manager
+
+    used = sqlite_manager.get_api_usage_today()
+    limit = settings.llm_daily_limit
+    print(f"오늘 LLM 요청: {used}/{limit} (남은 한도 {max(0, limit - used)})")
 
 
 # 문서를 컬렉션에서 삭제한다(벡터 청크 + 관계 + 문서 기록). 그로 인해 고립된 엔티티도 정리한다.
@@ -113,17 +193,21 @@ def cmd_graph(args) -> None:
 
 # 지정한 컬렉션 범위의 현황(문서/엔티티/관계 수, 사용 타입·관계)을 출력한다.
 def cmd_status(args) -> None:
-    from db import graph_manager, sqlite_manager, vector_manager
+    from db import document_store, graph_manager, sqlite_manager, vector_manager
 
     collections = _collections_from_args(args)
     scope = "전체" if collections is None else ", ".join(collections)
     print(f"=== 현황 (범위: {scope}) ===")
     print(f"문서 수: {sqlite_manager.count_documents(collections)}")
-    print(f"벡터 청크 수: {vector_manager.count_chunks()}")
+    print(f"벡터 청크 수: {vector_manager.count_chunks(collections)}")
     print(f"엔티티 수: {graph_manager.count_entities(collections)}")
     print(f"관계 수: {graph_manager.count_relations(collections)}")
     print(f"엔티티 타입: {', '.join(graph_manager.get_known_types(collections)) or '(없음)'}")
     print(f"관계 이름: {', '.join(graph_manager.get_known_predicates(collections)) or '(없음)'}")
+    # 고아 데이터는 컬렉션 경계 없이 전역으로만 탐지된다(추적이 끊긴 데이터라 소속을 알 수 없음).
+    orphan_count = len(document_store.find_orphaned_source_ids())
+    if orphan_count:
+        print(f"⚠️ 고아 데이터: {orphan_count}건 (전역) — ingest 시 자동 정리되거나 cleanup_db로 정리됩니다")
 
 
 # 존재하는 모든 컬렉션과 각 문서/엔티티 수를 나열한다.
@@ -177,7 +261,11 @@ def main(argv: list[str] | None = None) -> None:
     p_ingest.add_argument("files", nargs="*", help="처리할 파일 경로들")
     p_ingest.add_argument("--inbox", action="store_true", help="inbox/ 폴더를 일괄 처리")
     p_ingest.add_argument("--collection", help="대상 컬렉션(사업) 이름 (기본: default)")
+    p_ingest.add_argument("--dry-run", action="store_true", help="처리 없이 예상 요청 수만 표시")
+    p_ingest.add_argument("--force", action="store_true", help="하루 한도 초과 예상이어도 강행")
     p_ingest.set_defaults(func=cmd_ingest)
+
+    sub.add_parser("usage", help="오늘 LLM 요청 사용량/남은 한도").set_defaults(func=cmd_usage)
 
     p_delete = sub.add_parser("delete", help="문서 삭제(벡터/관계/기록 + 고립 엔티티 정리)")
     p_delete.add_argument("files", nargs="+", help="삭제할 파일명")

@@ -2,7 +2,7 @@
 import pytest
 from pydantic import ValidationError
 
-from schemas import EntityType, ExtractedEntity, ExtractionResult
+from schemas import EntityType, ExtractedEntity, ExtractedRelation, ExtractionResult
 
 
 def test_valid_extraction_parses():
@@ -43,3 +43,14 @@ def test_unknown_type_falls_back_to_other_instead_of_failing():
 def test_missing_type_defaults_to_other():
     entity = ExtractedEntity(name="무언가")
     assert entity.type is EntityType.OTHER
+
+
+def test_predicate_is_normalized_to_upper_snake_case():
+    # 표기 차이만 다른 같은 관계가 파편화되지 않도록 입구에서 대문자 스네이크케이스로 통일한다.
+    rel = ExtractedRelation(source="홍길동", target="OO전자", predicate="works at")
+    assert rel.predicate == "WORKS_AT"
+
+
+def test_predicate_normalizes_hyphen_and_surrounding_space():
+    rel = ExtractedRelation(source="A", target="B", predicate="  Located-In  ")
+    assert rel.predicate == "LOCATED_IN"

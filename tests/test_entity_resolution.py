@@ -37,7 +37,7 @@ def test_blacklist_prevents_merge(monkeypatch):
     sqlite_manager.init_schema()
     graph_manager.upsert_entity(C, "애플", "Asset", "스마트폰 제조사")
     graph_manager.upsert_entity(C, "Apple", "Asset", "스마트폰 제조사 기업")
-    sqlite_manager.add_merge_blacklist("애플", "Apple", "사용자가 직접 분리 지정")
+    sqlite_manager.add_merge_blacklist(C, "애플", "Apple", "사용자가 직접 분리 지정")
 
     candidates = entity_resolution.find_merge_candidates(C)
 
