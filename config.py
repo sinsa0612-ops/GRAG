@@ -29,7 +29,12 @@ class Settings(BaseSettings):
     # 일시적 오류(서버 과부하 5xx, 429 한도초과)일 때만 재시도한다. 잘못된 요청/인증 오류는 재시도 안 함.
     llm_max_retries: int = 2
     llm_retry_backoff_sec: float = 5.0
+    # Gemini 무료 등급 하루 요청 한도(RPD). 요청 수 = 청크 수라, ingest 전에 초과를 예측·차단하는 데 쓴다.
+    llm_daily_limit: int = 500
     merge_similarity_threshold: float = 0.92
+    # 컬렉션을 넘는 same_as 브릿지 '제안'에 쓰는 유사도 임계값. 교차 사업의 같은 대상은 설명이 조금씩
+    # 달라 병합 임계값보다 약간 느슨하게 둔다. 제안만 하고 실제 연결은 사용자가 결정한다(자동 연결 아님).
+    bridge_similarity_threshold: float = 0.90
     # 추출 프롬프트에 붙이는 '기존 엔티티 이름' 힌트의 최대 개수.
     # 전체 이름을 통째로 넣지 않고 현재 청크에 등장하는 이름만 이 개수까지 추려, 입력 토큰이 무한정 늘지 않게 한다.
     max_name_hints: int = 30

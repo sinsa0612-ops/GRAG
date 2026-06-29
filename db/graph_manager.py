@@ -71,6 +71,9 @@ def init_schema() -> None:
         "CREATE REL TABLE RELATION "
         "(FROM Entity TO Entity, predicate STRING, valid_from STRING, source_doc STRING, collection STRING)",
     )
+    # SAME_AS — 컬렉션 격벽을 넘는 유일한 연결선. 서로 다른 사업의 노드가 '같은 대상'임을 병합 없이 표시한다.
+    # RELATION과 다른 타입이라 기존 관계 질의(MATCH ...-[r:RELATION]->...)에는 절대 걸리지 않는다.
+    _execute_if_absent(conn, "CREATE REL TABLE SAME_AS (FROM Entity TO Entity)")
 
 
 # 엔티티 노드를 새로 만들거나 기존 노드의 타입/설명을 갱신한다(해당 컬렉션 범위 안에서).
@@ -435,3 +438,80 @@ def merge_entity_into(collection: str, keep_name: str, drop_name: str) -> None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+# 두 엔티티(서로 다른 컬렉션이어도 됨)를 SAME_AS 브릿지로 잇는다. 병합과 달리 노드는 그대로 두고
+# '같은 대상'이라는 연결선만 만든다. 무방향 중복을 막기 위해 두 id를 정렬해 한 방향(lo->hi)으로만 저장한다.
+# 양쪽 엔티티가 실제로 존재할 때만 연결하고, 같은 엔티티끼리는 잇지 않는다. 연결했으면 True.
+def add_bridge(collection_a: str, name_a: str, collection_b: str, name_b: str) -> bool:
+    id_a = _entity_id(collection_a, name_a)
+    id_b = _entity_id(collection_b, name_b)
+    if id_a == id_b:
+        return False
+    if not entity_exists(collection_a, name_a) or not entity_exists(collection_b, name_b):
+        logger.warning(
+            "브릿지 건너뜀 — 엔티티가 존재하지 않음: [%s] %s ↔ [%s] %s",
+            collection_a, name_a, collection_b, name_b,
+        )
+        return False
+    lo, hi = sorted([id_a, id_b])
+    conn = _get_connection()
+    conn.execute(
+        "MATCH (a:Entity {id: $lo}), (b:Entity {id: $hi}) MERGE (a)-[:SAME_AS]->(b)",
+        {"lo": lo, "hi": hi},
+    )
+    return True
+
+
+# 두 엔티티 사이의 SAME_AS 브릿지를 제거한다(저장 방향과 무관하게 id 정렬로 정확히 짚는다).
+def remove_bridge(collection_a: str, name_a: str, collection_b: str, name_b: str) -> None:
+    lo, hi = sorted([_entity_id(collection_a, name_a), _entity_id(collection_b, name_b)])
+    conn = _get_connection()
+    conn.execute(
+        "MATCH (a:Entity {id: $lo})-[r:SAME_AS]->(b:Entity {id: $hi}) DELETE r",
+        {"lo": lo, "hi": hi},
+    )
+
+
+# 두 엔티티가 SAME_AS로 연결돼 있는지 확인한다.
+def is_bridged(collection_a: str, name_a: str, collection_b: str, name_b: str) -> bool:
+    lo, hi = sorted([_entity_id(collection_a, name_a), _entity_id(collection_b, name_b)])
+    conn = _get_connection()
+    result = conn.execute(
+        "MATCH (a:Entity {id: $lo})-[:SAME_AS]->(b:Entity {id: $hi}) RETURN a.id", {"lo": lo, "hi": hi}
+    )
+    return result.has_next()
+
+
+# name 엔티티와 SAME_AS로 연결된 다른 엔티티들을 (무방향) 조회한다. 저장이 한 방향이라 양쪽을 모두 본다.
+# collections를 주면 그 범위에 속한 연결만 돌려준다(질의 스코프를 벗어난 사업은 끌어오지 않음).
+def get_bridges(collection: str, name: str, collections: list[str] | None = None) -> list[dict]:
+    conn = _get_connection()
+    entity_id = _entity_id(collection, name)
+    twins: list[dict] = []
+    for query in (
+        "MATCH (a:Entity {id: $id})-[:SAME_AS]->(b:Entity) RETURN b.collection, b.name",
+        "MATCH (a:Entity)-[:SAME_AS]->(b:Entity {id: $id}) RETURN a.collection, a.name",
+    ):
+        result = conn.execute(query, {"id": entity_id})
+        while result.has_next():
+            twin_collection, twin_name = result.get_next()
+            if collections is None or twin_collection in collections:
+                twins.append({"collection": twin_collection, "name": twin_name})
+    return twins
+
+
+# 그래프에 존재하는 모든 SAME_AS 브릿지를 (양쪽 컬렉션/이름) 목록으로 가져온다 (목록 표시/중복 제외용).
+def list_all_bridges() -> list[dict]:
+    conn = _get_connection()
+    result = conn.execute(
+        "MATCH (a:Entity)-[:SAME_AS]->(b:Entity) "
+        "RETURN a.collection, a.name, b.collection, b.name"
+    )
+    bridges: list[dict] = []
+    while result.has_next():
+        coll_a, name_a, coll_b, name_b = result.get_next()
+        bridges.append(
+            {"collection_a": coll_a, "name_a": name_a, "collection_b": coll_b, "name_b": name_b}
+        )
+    return bridges

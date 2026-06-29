@@ -98,6 +98,34 @@ def test_api_usage_accumulates_per_day():
     assert sqlite_manager.get_api_usage_today() == 100
 
 
+def test_collection_hierarchy_descendants():
+    # 부모 이름을 주면 자기 자신 + 모든 하위(자손)를 펼쳐야 한다(본부 단위 범위 조회).
+    sqlite_manager.init_schema()
+    sqlite_manager.set_collection_parent("사업A", "본부")
+    sqlite_manager.set_collection_parent("사업B", "본부")
+    sqlite_manager.set_collection_parent("팀A1", "사업A")
+
+    assert set(sqlite_manager.get_collection_descendants("본부")) == {"본부", "사업A", "사업B", "팀A1"}
+    assert set(sqlite_manager.get_collection_descendants("사업A")) == {"사업A", "팀A1"}
+    # 계층에 없는 컬렉션은 자기 자신만 반환된다.
+    assert sqlite_manager.get_collection_descendants("독립사업") == ["독립사업"]
+
+
+def test_collection_parent_set_and_unset():
+    sqlite_manager.init_schema()
+    sqlite_manager.set_collection_parent("사업A", "본부")
+    assert sqlite_manager.get_collection_parent("사업A") == "본부"
+    assert sqlite_manager.get_collection_children("본부") == ["사업A"]
+
+    # 부모를 바꾸면 덮어써진다.
+    sqlite_manager.set_collection_parent("사업A", "신본부")
+    assert sqlite_manager.get_collection_parent("사업A") == "신본부"
+
+    sqlite_manager.unset_collection_parent("사업A")
+    assert sqlite_manager.get_collection_parent("사업A") is None
+    assert sqlite_manager.get_collection_children("본부") == []
+
+
 def test_list_and_remove_merge_blacklist():
     sqlite_manager.init_schema()
     sqlite_manager.add_merge_blacklist(C, "애플", "Apple", "다른 의미")

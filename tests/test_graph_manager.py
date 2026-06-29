@@ -311,3 +311,61 @@ def test_delete_collection_removes_only_that_collection():
     assert graph_manager.count_entities(["사업A"]) == 0
     assert graph_manager.count_relations(["사업A"]) == 0
     assert graph_manager.count_entities(["사업B"]) == 1
+
+
+def test_bridge_connects_entities_across_collections():
+    # 서로 다른 사업의 같은 대상을 병합 없이 SAME_AS로 잇고, 무방향으로 조회된다.
+    graph_manager.init_schema()
+    graph_manager.upsert_entity("사업A", "김변호사", "Person", "법률 자문")
+    graph_manager.upsert_entity("사업B", "김변호사", "Person", "투자 자문")
+
+    assert graph_manager.add_bridge("사업A", "김변호사", "사업B", "김변호사") is True
+    assert graph_manager.is_bridged("사업A", "김변호사", "사업B", "김변호사") is True
+    # 순서를 바꿔도 같은 브릿지로 인식된다(무방향).
+    assert graph_manager.is_bridged("사업B", "김변호사", "사업A", "김변호사") is True
+
+    twins_a = graph_manager.get_bridges("사업A", "김변호사")
+    assert {"collection": "사업B", "name": "김변호사"} in twins_a
+    twins_b = graph_manager.get_bridges("사업B", "김변호사")
+    assert {"collection": "사업A", "name": "김변호사"} in twins_b
+
+    # 두 노드는 합쳐지지 않고 각자 그대로 존재한다(격벽 유지).
+    assert graph_manager.count_entities(["사업A"]) == 1
+    assert graph_manager.count_entities(["사업B"]) == 1
+
+
+def test_bridge_skips_when_entity_missing_or_self():
+    graph_manager.init_schema()
+    graph_manager.upsert_entity("사업A", "김변호사", "Person", "")
+
+    # 상대 엔티티가 없으면 연결되지 않는다.
+    assert graph_manager.add_bridge("사업A", "김변호사", "사업B", "없는사람") is False
+    # 같은 엔티티끼리는 연결하지 않는다.
+    assert graph_manager.add_bridge("사업A", "김변호사", "사업A", "김변호사") is False
+
+
+def test_get_bridges_respects_collection_scope():
+    # 스코프 밖 사업의 브릿지는 끌어오지 않는다(격벽 존중).
+    graph_manager.init_schema()
+    graph_manager.upsert_entity("사업A", "공통거래처", "ORGANIZATION", "")
+    graph_manager.upsert_entity("사업B", "공통거래처", "ORGANIZATION", "")
+    graph_manager.upsert_entity("사업C", "공통거래처", "ORGANIZATION", "")
+    graph_manager.add_bridge("사업A", "공통거래처", "사업B", "공통거래처")
+    graph_manager.add_bridge("사업A", "공통거래처", "사업C", "공통거래처")
+
+    scoped = graph_manager.get_bridges("사업A", "공통거래처", ["사업A", "사업B"])
+    names = {(t["collection"], t["name"]) for t in scoped}
+    assert ("사업B", "공통거래처") in names
+    assert ("사업C", "공통거래처") not in names
+
+
+def test_remove_bridge():
+    graph_manager.init_schema()
+    graph_manager.upsert_entity("사업A", "김변호사", "Person", "")
+    graph_manager.upsert_entity("사업B", "김변호사", "Person", "")
+    graph_manager.add_bridge("사업A", "김변호사", "사업B", "김변호사")
+
+    graph_manager.remove_bridge("사업B", "김변호사", "사업A", "김변호사")  # 순서 무관 해제
+
+    assert graph_manager.is_bridged("사업A", "김변호사", "사업B", "김변호사") is False
+    assert graph_manager.list_all_bridges() == []

@@ -97,6 +97,16 @@ def init_schema() -> None:
             )
             """
         )
+        # 컬렉션(사업) 계층 — 상위 '본부' 아래 사업들을 묶는다. parent가 없는 컬렉션은 행이 없을 수도 있다.
+        # 범위 질의에서 부모 이름을 주면 자손까지 펼쳐, 본부 단위/전체 단위를 골라 볼 수 있게 한다.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collection_meta (
+                collection TEXT PRIMARY KEY,
+                parent TEXT
+            )
+            """
+        )
         # (collection, file_name)을 문서의 자연 식별자로 강제한다. 같은 파일명을 다른 사업(컬렉션)에서 써도
         # 충돌하지 않게 하고, 같은 컬렉션 안에서 같은 파일 재처리 시 옛 행이 자동 교체(유령 행 방지)되게 한다.
         # 기존 DB에 중복 행이 있으면 가장 최근(rowid 최대) 행만 남기고 정리한 뒤 UNIQUE로 승격한다.
@@ -213,6 +223,66 @@ def get_collection_doc_counts() -> dict[str, int]:
             "SELECT collection, COUNT(*) FROM documents GROUP BY collection"
         ).fetchall()
     return {row[0]: row[1] for row in rows}
+
+
+# 컬렉션의 부모(본부)를 지정한다. parent가 같은 이름이거나 순환을 만들면 호출 측에서 막아야 한다.
+def set_collection_parent(collection: str, parent: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO collection_meta (collection, parent) VALUES (?, ?) "
+            "ON CONFLICT(collection) DO UPDATE SET parent = ?",
+            (collection, parent, parent),
+        )
+
+
+# 컬렉션의 부모 지정을 해제한다.
+def unset_collection_parent(collection: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM collection_meta WHERE collection = ?", (collection,))
+
+
+# 컬렉션의 직속 부모를 조회한다 (없으면 None).
+def get_collection_parent(collection: str) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT parent FROM collection_meta WHERE collection = ?", (collection,)
+        ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+# 어떤 컬렉션의 직속 자식들을 조회한다.
+def get_collection_children(parent: str) -> list[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT collection FROM collection_meta WHERE parent = ? ORDER BY collection",
+            (parent,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+# 컬렉션 자신 + 모든 하위(자식의 자식까지)를 반환한다. 범위 질의에서 부모를 자손까지 펼칠 때 쓴다.
+# 순환(A가 B의 부모이면서 B가 A의 부모)이 있어도 방문 집합으로 보호해 무한 루프에 빠지지 않는다.
+def get_collection_descendants(collection: str) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    stack = [collection]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        result.append(current)
+        stack.extend(get_collection_children(current))
+    return result
+
+
+# 부모가 지정된 모든 (컬렉션, 부모) 쌍을 가져온다 (계층 트리 표시용).
+def list_collection_hierarchy() -> dict[str, str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT collection, parent FROM collection_meta WHERE parent IS NOT NULL AND parent != ''"
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
 
 
 # 두 노드가 해당 컬렉션의 병합 금지 목록에 있는지 확인한다 (순서 무관).

@@ -11,13 +11,25 @@ from config import settings
 
 # 조회 계열(query/graph/status/merge)에서 대상 컬렉션 범위를 정한다.
 # --all 또는 아무것도 주지 않으면 None(전체 컬렉션 종합), --collection A,B면 그 목록으로 좁힌다.
+# 계층이 지정돼 있으면 부모 이름은 자손 컬렉션까지 자동으로 펼친다(본부 단위 조회).
 def _collections_from_args(args) -> list[str] | None:
     if getattr(args, "all", False):
         return None
     raw = getattr(args, "collection", None)
-    if raw:
-        return [c.strip() for c in raw.split(",") if c.strip()]
-    return None
+    if not raw:
+        return None
+
+    from db import sqlite_manager
+
+    names = [c.strip() for c in raw.split(",") if c.strip()]
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        for descendant in sqlite_manager.get_collection_descendants(name):
+            if descendant not in seen:
+                seen.add(descendant)
+                expanded.append(descendant)
+    return expanded or None
 
 
 # DB 3종 스키마를 초기화한다. --reset이면 기존 graphrag_dbs/를 통째로 지우고 새로 만든다.
@@ -210,7 +222,7 @@ def cmd_status(args) -> None:
         print(f"⚠️ 고아 데이터: {orphan_count}건 (전역) — ingest 시 자동 정리되거나 cleanup_db로 정리됩니다")
 
 
-# 존재하는 모든 컬렉션과 각 문서/엔티티 수를 나열한다.
+# 존재하는 모든 컬렉션과 각 문서/엔티티 수를 나열한다. 부모-자식 계층이 있으면 트리(들여쓰기)로 보여준다.
 def cmd_collections(args) -> None:
     from db import graph_manager, sqlite_manager
 
@@ -219,9 +231,27 @@ def cmd_collections(args) -> None:
     if not all_collections:
         print("(아직 컬렉션이 없습니다)")
         return
-    for collection in all_collections:
+
+    parent_of = sqlite_manager.list_collection_hierarchy()  # {자식: 부모}
+    children_of: dict[str, list[str]] = {}
+    for child, parent in parent_of.items():
+        children_of.setdefault(parent, []).append(child)
+
+    # 한 컬렉션과 그 자손을 들여쓰기로 출력한다.
+    def _print_node(collection: str, depth: int) -> None:
         entity_count = graph_manager.count_entities([collection])
-        print(f"- {collection}: 문서 {doc_counts.get(collection, 0)}개, 엔티티 {entity_count}개")
+        indent = "  " * depth
+        print(f"{indent}- {collection}: 문서 {doc_counts.get(collection, 0)}개, 엔티티 {entity_count}개")
+        for child in sorted(children_of.get(collection, [])):
+            _print_node(child, depth + 1)
+
+    # 루트 = 부모가 없거나, 부모가 실제 컬렉션 목록에 없는 것(고아 부모 방지).
+    roots = [
+        c for c in all_collections
+        if parent_of.get(c) is None or parent_of.get(c) not in all_collections
+    ]
+    for root in roots:
+        _print_node(root, 0)
 
 
 # 엔티티 자동 병합(컬렉션 내)을 실행한다.
@@ -230,6 +260,80 @@ def cmd_merge(args) -> None:
 
     entity_resolution.run(_collections_from_args(args))
     print("병합 작업 완료")
+
+
+# "컬렉션:이름" 형식 인자를 (컬렉션, 이름)으로 가른다. 형식이 틀리면 None.
+def _parse_ref(ref: str) -> tuple[str, str] | None:
+    if not ref or ":" not in ref:
+        return None
+    collection, name = ref.split(":", 1)
+    collection, name = collection.strip(), name.strip()
+    return (collection, name) if collection and name else None
+
+
+# 컬렉션을 넘는 SAME_AS 브릿지를 관리한다(add/remove/list/suggest). 같은 대상을 사업 간에 병합 없이 연결한다.
+def cmd_bridge(args) -> None:
+    from db import graph_manager
+
+    if args.action == "list":
+        bridges = graph_manager.list_all_bridges()
+        if not bridges:
+            print("(아직 브릿지가 없습니다)")
+            return
+        for b in bridges:
+            print(f"- [{b['collection_a']}] {b['name_a']} ↔ [{b['collection_b']}] {b['name_b']}")
+        return
+
+    if args.action == "suggest":
+        from pipeline import bridge
+
+        candidates = bridge.find_bridge_candidates(args.threshold)
+        if not candidates:
+            print("(브릿지 후보가 없습니다)")
+            return
+        print("컬렉션 간 브릿지 후보(유사도 높은 순):")
+        for coll_a, name_a, coll_b, name_b, score in sorted(candidates, key=lambda c: -c[4]):
+            print(f"- [{coll_a}] {name_a} ↔ [{coll_b}] {name_b}  (유사도 {score * 100:.1f}%)")
+        print("\n연결하려면: graphrag bridge add --from 컬렉션:이름 --to 컬렉션:이름")
+        return
+
+    # add / remove 는 --from, --to 가 필요하다.
+    ref_a = _parse_ref(args.from_ref)
+    ref_b = _parse_ref(args.to_ref)
+    if not ref_a or not ref_b:
+        print("--from/--to 는 '컬렉션:이름' 형식이어야 합니다 (예: --from 사업A:김변호사 --to 사업B:김변호사).")
+        return
+
+    if args.action == "add":
+        ok = graph_manager.add_bridge(ref_a[0], ref_a[1], ref_b[0], ref_b[1])
+        result = "연결됨" if ok else "실패(엔티티 없음 또는 동일 대상)"
+        print(f"브릿지 {result}: [{ref_a[0]}] {ref_a[1]} ↔ [{ref_b[0]}] {ref_b[1]}")
+    else:  # remove
+        graph_manager.remove_bridge(ref_a[0], ref_a[1], ref_b[0], ref_b[1])
+        print(f"브릿지 해제: [{ref_a[0]}] {ref_a[1]} ↔ [{ref_b[0]}] {ref_b[1]}")
+
+
+# 컬렉션에 부모(본부)를 지정한다. 순환이 생기는 지정은 거부한다.
+def cmd_set_parent(args) -> None:
+    from db import sqlite_manager
+
+    if args.child == args.parent:
+        print("자기 자신을 부모로 지정할 수 없습니다.")
+        return
+    # 부모가 이미 자식의 자손이면, 이 지정은 순환을 만든다 → 거부.
+    if args.parent in sqlite_manager.get_collection_descendants(args.child):
+        print(f"순환이 생겨 거부합니다: '{args.parent}'은(는) 이미 '{args.child}'의 하위입니다.")
+        return
+    sqlite_manager.set_collection_parent(args.child, args.parent)
+    print(f"계층 설정: '{args.child}' → 부모 '{args.parent}'")
+
+
+# 컬렉션의 부모 지정을 해제한다.
+def cmd_unset_parent(args) -> None:
+    from db import sqlite_manager
+
+    sqlite_manager.unset_collection_parent(args.child)
+    print(f"계층 해제: '{args.child}'")
 
 
 # DB 전체를 백업한다.
@@ -299,6 +403,22 @@ def main(argv: list[str] | None = None) -> None:
     p_merge.add_argument("--collection", help="범위 컬렉션(쉼표로 여러 개)")
     p_merge.add_argument("--all", action="store_true", help="전체 컬렉션")
     p_merge.set_defaults(func=cmd_merge)
+
+    p_bridge = sub.add_parser("bridge", help="컬렉션 간 같은 대상 연결(SAME_AS 브릿지)")
+    p_bridge.add_argument("action", choices=["add", "remove", "list", "suggest"], help="동작")
+    p_bridge.add_argument("--from", dest="from_ref", help="컬렉션:이름 (add/remove)")
+    p_bridge.add_argument("--to", dest="to_ref", help="컬렉션:이름 (add/remove)")
+    p_bridge.add_argument("--threshold", type=float, help="suggest 유사도 임계값(0~1)")
+    p_bridge.set_defaults(func=cmd_bridge)
+
+    p_setparent = sub.add_parser("set-parent", help="컬렉션에 부모(본부) 지정")
+    p_setparent.add_argument("child", help="자식 컬렉션 이름")
+    p_setparent.add_argument("parent", help="부모(본부) 컬렉션 이름")
+    p_setparent.set_defaults(func=cmd_set_parent)
+
+    p_unsetparent = sub.add_parser("unset-parent", help="컬렉션 부모 지정 해제")
+    p_unsetparent.add_argument("child", help="자식 컬렉션 이름")
+    p_unsetparent.set_defaults(func=cmd_unset_parent)
 
     sub.add_parser("backup", help="DB 백업").set_defaults(func=cmd_backup)
     p_restore = sub.add_parser("restore", help="백업 복원")

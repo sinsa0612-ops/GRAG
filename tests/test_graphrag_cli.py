@@ -89,3 +89,114 @@ def test_cli_delete_collection_clears_it(tmp_path, monkeypatch, capsys):
 
     assert graph_manager.count_entities(["사업B"]) == 0
     assert "삭제 완료" in capsys.readouterr().out
+
+
+def test_cli_ingest_dry_run_shows_estimate_only(tmp_path, monkeypatch, capsys):
+    # --dry-run은 예상 요청 수만 보여주고 실제 처리는 하지 않는다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    monkeypatch.setattr(settings, "chunk_size", 10)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+
+    graphrag_cli.main(["init"])
+    memo = tmp_path / "memo.md"
+    memo.write_text("가" * 25, encoding="utf-8")  # 3청크
+
+    graphrag_cli.main(["ingest", str(memo), "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "예상 3 요청" in out
+    assert "dry-run" in out
+    assert memo.exists()  # 처리 안 함 → 원본 그대로
+
+
+def test_cli_ingest_blocks_when_over_daily_limit(tmp_path, monkeypatch, capsys):
+    # 예상 + 오늘 사용량이 하루 한도를 넘으면 차단하고 분할을 안내한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    monkeypatch.setattr(settings, "chunk_size", 10)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+    monkeypatch.setattr(settings, "llm_daily_limit", 2)
+    from db import graph_manager
+
+    graphrag_cli.main(["init"])
+    memo = tmp_path / "big.md"
+    memo.write_text("가" * 25, encoding="utf-8")  # 3청크 > 한도 2
+
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A"])
+
+    out = capsys.readouterr().out
+    assert "한도 초과" in out
+    assert "나눠" in out
+    assert memo.exists()  # 차단 → 처리 안 함, 원본 그대로
+    assert graph_manager.count_entities() == 0
+
+
+def test_cli_ingest_force_overrides_limit(tmp_path, monkeypatch):
+    # --force는 한도 초과 예상이어도 강행한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    monkeypatch.setattr(settings, "chunk_size", 10)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+    monkeypatch.setattr(settings, "llm_daily_limit", 1)
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: json.dumps({"entities": [], "relations": []})
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+
+    graphrag_cli.main(["init"])
+    memo = tmp_path / "m.md"
+    memo.write_text("가" * 25, encoding="utf-8")
+
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A", "--force"])
+
+    assert not memo.exists()  # force로 처리됨 → processed/로 이동
+
+
+def test_cli_usage_reports_today(capsys):
+    from db import sqlite_manager
+
+    graphrag_cli.main(["init"])
+    sqlite_manager.record_api_usage(5)
+    graphrag_cli.main(["usage"])
+
+    assert "5/" in capsys.readouterr().out
+
+
+def test_cli_set_parent_expands_status_scope(tmp_path, monkeypatch, capsys):
+    # 본부 아래 사업A를 묶고 status --collection 본부를 보면 자손(사업A) 엔티티까지 합산돼야 한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    monkeypatch.setattr(
+        ingest,
+        "generate",
+        lambda prompt, **kwargs: json.dumps(
+            {"entities": [{"name": "김부장", "type": "Person", "description": ""}], "relations": []}
+        ),
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+
+    graphrag_cli.main(["init"])
+    memo = tmp_path / "memo.md"
+    memo.write_text("김부장은 일한다.", encoding="utf-8")
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A"])
+    graphrag_cli.main(["set-parent", "사업A", "본부"])
+    capsys.readouterr()  # 이전 출력 비우기
+
+    graphrag_cli.main(["status", "--collection", "본부"])
+
+    assert "엔티티 수: 1" in capsys.readouterr().out
+
+
+def test_cli_bridge_add_and_list(tmp_path, monkeypatch, capsys):
+    # bridge add로 사업 간 같은 대상을 연결하고 bridge list에 보이는지 확인한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import graph_manager
+
+    graphrag_cli.main(["init"])
+    graph_manager.upsert_entity("사업A", "김변호사", "Person", "")
+    graph_manager.upsert_entity("사업B", "김변호사", "Person", "")
+
+    graphrag_cli.main(["bridge", "add", "--from", "사업A:김변호사", "--to", "사업B:김변호사"])
+    capsys.readouterr()
+    graphrag_cli.main(["bridge", "list"])
+
+    out = capsys.readouterr().out
+    assert "김변호사" in out
+    assert "사업A" in out and "사업B" in out
