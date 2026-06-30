@@ -17,3 +17,7 @@ exports/
 # Claude Code 런타임 락 / 임시 QA 출력
 .claude/scheduled_tasks.lock
 qa_result.txt
+
+# 구글 드라이브 동기화 임시 폴더
+.tmp.drivedownload/
+.tmp.driveupload/
