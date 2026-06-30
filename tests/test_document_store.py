@@ -54,6 +54,36 @@ def test_chunk_text_prefers_sentence_boundaries():
     assert chunks[0].rstrip().endswith(".")  # 첫 청크가 문장 끝에서 마무리됨
 
 
+def test_clean_markdown_drops_empty_table_grid():
+    # 빈 셀 격자와 구분선은 통째로 사라지고, 내용 있는 셀만 공백으로 이어져야 한다.
+    raw = (
+        "| 기관명 |     | 케이퓨얼셀 |     | 등록번호 | 111-88 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "|     |     |     |     |     |     |\n"
+        "본문 문장이다."
+    )
+    cleaned = document_store.clean_markdown(raw)
+
+    assert "기관명 케이퓨얼셀 등록번호 111-88" in cleaned
+    assert "---" not in cleaned
+    assert "|     |" not in cleaned
+    assert "본문 문장이다." in cleaned
+
+
+def test_clean_markdown_leaves_plain_text_untouched():
+    # 표가 없는 일반 문장은 글자 손실 없이 그대로 남아야 한다.
+    raw = "강택리는 기획자다. 두 번째 문장이다."
+    assert document_store.clean_markdown(raw) == raw
+
+
+def test_clean_markdown_reduces_chunk_count(monkeypatch):
+    # 표 노이즈를 걷어내면 같은 문서라도 예상 청크 수(=LLM 호출 수)가 줄어든다.
+    monkeypatch.setattr(settings, "chunk_size", 20)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+    noisy = ("|   |   |   |   |\n" * 50) + "핵심 내용 한 줄."
+    assert document_store.estimate_request_count(noisy) == 1
+
+
 def test_needs_processing_detects_change():
     sqlite_manager.init_schema()
     assert document_store.needs_processing(C, "memo.md", "hash1") is True

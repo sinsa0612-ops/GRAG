@@ -1,46 +1,58 @@
-# 구현 계획서 — 컬렉션 유기적 고도화 ①②③ (격벽 유지 + 옵트인 연결)
+# 구현 계획서 — 잠수함 문서 추출 품질 개선 (Tier 1~3 + 재인덱싱)
+
+> 직전 M2(컬렉션 유기적 고도화) 계획서를 본 작업 계획으로 덮어씀.
+> M2 설계는 `HANDOFF-main.md` 마일스톤과 git 이력에 보존되어 있음.
 
 ## 1. 목적 / 배경
-- 사업(컬렉션) 격벽은 유지하되, 필요할 때만 '문'을 내어 종합 통찰이 가능하게 한다.
-- 모두 **추가형**(기존 데이터/질의/격벽 무변경)이며 **옵트인**(명시 연결)이라 무관한 사업이 자동으로 엮이지 않는다.
+- `잠수함 기술개발` 컬렉션 1건(연구개발계획서, 57.8만 자)의 추출 품질을 개선한다.
+- 실측 진단: 엔티티 989 / 관계 2183. 양은 충분하나 **파편화·잡티·미연결**로 밀도가 희석됨.
+  - 핵심 주제 "연료전지"가 4개 노드로 분할(연결 129/98/69/31).
+  - `merge` 미실행(alias 0/989)이고, **실행해도** 현재 방식(이름+설명 임베딩, 0.92)으로는 파편이 안 합쳐짐(측정값: '연료전지 시스템'~'연료전지시스템' 0.830).
+  - 잡티 엔티티 ~151개(특허번호 `10-21xxxxx`, 과제코드 `RS-2026-...`, 주소·제목 통째).
+  - 과잉 허브(홍스웍스 202), 장비→연료전지 `CREATED` 오연결, `RELATED_TO` 286건(13%).
+  - 원본 표 노이즈 51%(빈 셀) → 정리 시 청크 ~370→~180(LLM 호출·비용 절반).
+- 제약 준수: **가성비 추출 유지(청크당 1회·무료 Flash-lite), LangChain 미도입, KISS, 격벽 불변.**
 
 ## 2. 구조 사전 이해 보고서 (3줄)
-1. 엔티티 정체성 `(collection,name)` 격벽은 그대로 두고, 그 위에 ①컬렉션을 넘는 유일 연결선 SAME_AS ②종합 시 걸침을 표면화하는 질의 ③컬렉션 부모-자식 메타를 추가한다.
-2. 새 어휘는 DAL(`db/*`)로만 접근, 기존 `RELATION` 질의·백업 경로에 영향 없음(별도 rel 타입/별도 테이블).
-3. 책임 분리: 브릿지=Kuzu, 계층=SQLite, 교차 인사이트=query 로직.
+1. **근본 원인:** ①추출 프롬프트가 식별자/긴제목/약한관계를 거르지 않음 ②`merge`의 임베딩 입력에 설명문이 섞여 같은 대상이 매번 다른 설명을 받아 유사도가 깎임 ③원본 표 노이즈가 청크 예산을 절반 잡아먹어 추출 집중도↓.
+2. **데이터 흐름:** `process_file`(raw 해시/저장은 그대로) → **신규 전처리(표 정리)** → `chunk_text` → `extract_chunk`(프롬프트 보강) → 저장. ingest 종료 후 **`merge` 자동 1회**. DB 스키마·격벽·RELATION 질의·백업 경로 **무변경**.
+3. **정석 해결:** 프롬프트(가성비 트랙), 병합 로직(이름기준+무료 정규화병합), 전처리(순수 정규식·외부라이브러리 없음→어댑터 불요, document_store에 귀속)만 손대고 폭발 반경 최소화.
 
 ## 3. 설계
 
-### ① 공유 엔티티 SAME_AS 브릿지 (db/graph_manager.py, pipeline/bridge.py, CLI)
-- Kuzu에 `CREATE REL TABLE SAME_AS (FROM Entity TO Entity)` 추가(속성 없음). RELATION과 다른 타입이라 기존 질의에 안 걸린다.
-- 무방향 중복 방지: 두 엔티티 id를 정렬해 `lo -[:SAME_AS]-> hi` 한 방향으로만 저장(조회는 양방향 합집합).
-- 함수: `add_bridge / remove_bridge / get_bridges / list_all_bridges / is_bridged`. 양쪽 엔티티가 실제 존재할 때만 연결.
-- 제안: `pipeline/bridge.py.find_bridge_candidates(threshold)` — **서로 다른 컬렉션** 엔티티를 임베딩 유사도로 비교해 후보만 반환(파괴적 병합 아님, 실제 연결은 사용자 결정). 이미 브릿지된 쌍은 제외.
-- 설정: `config.bridge_similarity_threshold = 0.90`(교차 동일 대상은 약간 느슨하게).
+### Tier 1 — 추출 프롬프트 보강 (`pipeline/ingest.py`)
+`_EXTRACTION_PROMPT`에 규칙 추가(문자열만 변경, 로직 무변경):
+- 순수 식별자/코드/수치 단독은 엔티티 금지: 특허번호(`10-2125457`), 과제·공고번호(`RS-...`, `제2026-71호`), 사업자/법인등록번호, 전화번호, 주소 전체.
+- 엔티티 이름은 **가장 짧은 표준 명칭**으로. 과제명·논문제목·문장 전체를 이름으로 쓰지 말 것.
+- `RELATED_TO`는 마땅한 구체 관계가 없을 때만 최후로. 가능하면 구체 predicate 선택.
+- 단지 같은 목록/표에 함께 등장한다는 이유로 장비·도구를 주제(예: 연료전지)에 `CREATED/PRODUCES`로 잇지 말 것(텍스트가 그 행위를 말할 때만).
 
-### ② 교차 인사이트 질의 (query.py)
-- `_gather_graph_context`에서 매칭 엔티티마다 `get_bridges(범위 내)`를 따라가, 같은 대상이 2개 이상 사업에 걸치면 "※ N개 사업에 걸쳐 있음" 표시 + 브릿지된 쌍의 관계도 컨텍스트에 포함.
-- **걸침 판정은 '브릿지(명시)'만 사용** — 단순 동명이인을 같은 사람으로 오인하지 않게(기존 동명이인 방어 원칙 유지).
-- 스코프 존중: `--all`이면 전 컬렉션 횡단, `--collection A,B`면 그 범위 내 걸침만. 스코프 밖은 절대 끌어오지 않음.
+### Tier 2 — 병합 로직 보강 (`pipeline/entity_resolution.py`, `db/graph_manager.py`)
+- **(a) 무료 정규화 병합(신규, 임베딩 불요):** 이름을 정규화(공백·구두점 제거 + 소문자)했을 때 충돌하는 노드들을 한 그룹으로 병합. `연료전지 시스템`=`연료전지시스템` 즉시 해결. 안전: 알파벳·기호 구성이 동일한 경우에만 합치므로 `GC/FID`≠`GC/FID/TCD`는 안 합쳐짐. blacklist 존중, 보존 노드=연결수 최다(동률 시 최단 이름).
+- **(b) 임베딩 입력에서 설명문 제외:** `find_merge_candidates`가 `name: description` 대신 **이름만** 임베딩(측정상 이름만일 때 '연료전지 시스템'~'연료전지시스템' 0.984로 회수됨). 임계값 0.92 유지(이름만 0.92는 오병합 방어에 충분).
+- **(c) ingest 종료 후 자동 병합:** `cmd_ingest`가 처리 후 해당 컬렉션에 `entity_resolution.run([collection])` 1회 호출(임베딩 로컬=추가 비용 0). `--no-merge`로 끌 수 있게.
+- 의미상 병합이 필요하나 위험한 부분집합 쌍(`연료전지`⊂`연료전지 시스템`, `공기`⊂`공기밸브류`)은 **자동 병합하지 않음**(오병합 위험). 기존 수동 `merge`/blacklist로 처리.
 
-### ③ 컬렉션 계층 (db/sqlite_manager.py, CLI)
-- `collection_meta(collection TEXT PK, parent TEXT)` 추가.
-- 함수: `set_collection_parent / unset_collection_parent / get_collection_parent / get_collection_children / get_collection_descendants(자기+하위, 순환 보호) / list_collection_hierarchy`.
-- CLI `_collections_from_args`가 `--collection 본부`를 자손까지 펼쳐 범위 결정. 순환 생성은 거부.
+### Tier 3 — 마크다운 표 노이즈 전처리 (`db/document_store.py`)
+- 신규 `clean_markdown(content)`: 빈 표줄/구분선(`|---|`) 제거, 표 행은 비어있지 않은 셀만 공백 join, 3줄 이상 빈 줄 압축.
+- **호출 위치:** `process_file`에서 `chunk_text` 직전 + `estimate_request_count`(예상치=실제 일치). **해시·원본 저장은 raw 그대로**(변경 감지 정확성 유지). 청크/임베딩/추출만 정리본 사용.
+- 외부 라이브러리 없음(순수 `re`) → 어댑터 불요, `chunk_text`와 같은 모듈에 귀속(기존 `chunk_text` 시그니처·테스트 불변).
 
-### CLI 추가
-- `graphrag bridge add|remove|list|suggest [--from C:N --to C:N] [--collection] [--threshold]`
-- `graphrag set-parent <child> <parent>`, `graphrag unset-parent <child>`
-- `graphrag collections`를 트리(들여쓰기)로 표시하도록 보강.
+### 재인덱싱 (코드 변경 후 1회)
+1. `backup_db.py`로 안전 백업.
+2. `graphrag delete-collection "잠수함 기술개발"`(그래프+벡터+문서기록 제거).
+3. `graphrag ingest "processed/잠수함 기술개발/잠수함 사업계획서.md" --collection "잠수함 기술개발"`(자동 병합 포함).
+4. `db_status.py`로 before/after 비교(엔티티·관계·고립·잡티 수).
 
 ## 4. 영향 파일
-- 코드: `config.py`, `db/graph_manager.py`, `db/sqlite_manager.py`, `query.py`, `graphrag_cli.py`, 신규 `pipeline/bridge.py`.
-- 테스트: `test_graph_manager.py`(브릿지), 신규 `test_bridge.py`(후보), `test_query.py`(교차 인사이트), `test_sqlite_manager.py`(계층), `test_graphrag_cli.py`(스코프 확장).
+- 코드: `pipeline/ingest.py`(프롬프트), `pipeline/entity_resolution.py`(정규화병합·이름임베딩), `db/graph_manager.py`(정규화병합 helper, 필요시), `db/document_store.py`(clean_markdown), `graphrag_cli.py`(자동병합 훅·`--no-merge`).
+- 테스트: `test_pipeline_ingest.py`, `test_entity_resolution.py`, `test_document_store.py`(clean_markdown), `test_graphrag_cli.py`.
 
 ## 5. 검증
-- `pytest` 전체 그린 + 브릿지/계층/교차 인사이트 신규 케이스.
-- 스모크: bridge add→query --all에서 걸침 표시, set-parent→status --collection 본부가 자손 포함.
+- `pytest` 전체 그린 + 신규 케이스(정규화병합/clean_markdown/프롬프트 가드).
+- 스모크: 재인덱싱 후 `db_status`에서 엔티티 수 감소(파편 병합)·잡티 감소·연료전지 단일 허브화 확인.
 
 ## 6. 알려진 한계(허용)
-- 컬렉션 내 병합(merge_entity_into)으로 사라지는 노드가 브릿지를 갖고 있었다면 그 브릿지는 유실(드묾) — 추후 보강 대상.
-- 브릿지 후보 탐색은 전 엔티티 O(N²) 비교(개인 규모 허용).
+- 부분집합형 의미 병합은 자동화 안 함(오병합 위험) — 수동 `merge`/`bridge`로.
+- 표 전처리는 휴리스틱(완벽한 표 의미 복원 아님) — 목적은 노이즈 제거·집중도 향상.
+- 재인덱싱 LLM 호출 ~180회(하루 한도 500 내).

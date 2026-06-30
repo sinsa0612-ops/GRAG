@@ -15,6 +15,28 @@ def compute_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# PDF/HWP에서 변환된 마크다운의 표 노이즈(빈 셀 그리드 `|   |   |`, 구분선 `|---|`)를 걷어낸다.
+# 빈 칸 격자가 청크 예산을 절반 가까이 잡아먹어 추출 집중도를 떨어뜨리기 때문에, 청킹 직전에만 적용한다.
+# (해시·원본 저장은 raw 그대로 두어 변경 감지 정확성을 유지하고, 청킹/임베딩/추출 입력만 정리본을 쓴다.)
+# 표 행은 비어있지 않은 셀만 공백으로 이어 붙여 실제 정보(기관명·번호 등)는 보존한다.
+def clean_markdown(content: str) -> str:
+    cleaned_lines: list[str] = []
+    for line in content.split("\n"):
+        # 표 구분선/빈 표줄(파이프와 공백·콜론·하이픈만으로 된 줄)은 통째로 버린다.
+        if "|" in line and re.fullmatch(r"[\s|:\-]*", line):
+            continue
+        # 표 행(파이프 3개 이상)은 빈 셀을 빼고 내용 있는 셀만 공백으로 잇는다.
+        if line.count("|") >= 3:
+            cells = [cell.strip() for cell in line.split("|")]
+            cells = [cell for cell in cells if cell]
+            if not cells:
+                continue
+            line = " ".join(cells)
+        cleaned_lines.append(line)
+    # 표를 걷어내며 생긴 과도한 빈 줄(3줄 이상)을 두 줄로 압축한다.
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines))
+
+
 # 문장/문단 경계를 우선해 자르기 위한 구분자 우선순위.
 # 위에서부터 차례로 시도하고, 어떤 것도 안 통하면 최후에 글자 단위(None)로 쪼갠다.
 # 문장 구분자는 문장부호 뒤 공백을 노려, 문장부호 자체는 앞 문장에 남겨 보존한다.
@@ -83,8 +105,9 @@ def chunk_text(content: str, chunk_size: int, overlap: int = 0) -> list[str]:
 
 
 # 이 문서를 처리할 때 나갈 LLM 요청 수(= 청크 수)를 미리 계산한다 (RPD 한도 예측용).
+# 실제 처리와 동일하게 표 노이즈를 걷어낸 뒤 청킹해야 예상치와 실제 호출 수가 일치한다.
 def estimate_request_count(content: str) -> int:
-    return len(chunk_text(content, settings.chunk_size, settings.chunk_overlap))
+    return len(chunk_text(clean_markdown(content), settings.chunk_size, settings.chunk_overlap))
 
 
 # 저장된 해시와 비교해 재처리가 필요한지 판단한다 (해당 컬렉션 범위에서).

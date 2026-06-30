@@ -54,6 +54,18 @@ def _report_orphan_cleanup() -> None:
         print(f"고아 데이터 {removed}건 자동 정리됨")
 
 
+# ingest 직후 해당 컬렉션의 중복 엔티티를 자동 병합한다(표기 정규화 + 임베딩, 임베딩은 로컬이라 추가 비용 0).
+# 같은 문서를 추출하다 갈라진 표기 파편을 그 자리에서 정리해, 그래프가 파편화된 채 쌓이지 않게 한다.
+# --no-merge로 끌 수 있다.
+def _run_auto_merge(collection: str, args) -> None:
+    if getattr(args, "no_merge", False):
+        return
+    from pipeline import entity_resolution
+
+    print("엔티티 자동 병합 중...")
+    entity_resolution.run([collection])
+
+
 # 한도 초과로 차단됐을 때, 문서를 몇 개로 쪼개야 하는지 안내한다.
 def _print_split_guidance(estimates: list[tuple], remaining: int, limit: int) -> None:
     step = max(1, settings.chunk_size - settings.chunk_overlap)
@@ -132,6 +144,7 @@ def cmd_ingest(args) -> None:
     if args.inbox:
         process_inbox.process_inbox(collection)
         _report_orphan_cleanup()
+        _run_auto_merge(collection, args)
         return
     for path, _ in estimates:
         try:
@@ -148,6 +161,7 @@ def cmd_ingest(args) -> None:
         status = "처리 완료" if changed else "변경 없음(이미 처리됨)"
         print(f"[{collection}] {path.name}: {status} — processed/{collection}/로 이동")
     _report_orphan_cleanup()
+    _run_auto_merge(collection, args)
 
 
 # 오늘 LLM 요청 사용량과 남은 한도를 출력한다.
@@ -367,6 +381,7 @@ def main(argv: list[str] | None = None) -> None:
     p_ingest.add_argument("--collection", help="대상 컬렉션(사업) 이름 (기본: default)")
     p_ingest.add_argument("--dry-run", action="store_true", help="처리 없이 예상 요청 수만 표시")
     p_ingest.add_argument("--force", action="store_true", help="하루 한도 초과 예상이어도 강행")
+    p_ingest.add_argument("--no-merge", action="store_true", help="처리 후 엔티티 자동 병합을 건너뜀")
     p_ingest.set_defaults(func=cmd_ingest)
 
     sub.add_parser("usage", help="오늘 LLM 요청 사용량/남은 한도").set_defaults(func=cmd_usage)

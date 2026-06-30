@@ -101,6 +101,65 @@ def test_merge_only_happens_within_a_collection(monkeypatch):
     assert graph_manager.count_entities() == 2
 
 
+def test_normalize_name_collapses_spacing_and_symbols():
+    # 공백·구두점·대소문자만 다른 표기는 같은 키, 구성 문자가 다르면 다른 키여야 한다.
+    assert entity_resolution._normalize_name("연료전지 시스템") == entity_resolution._normalize_name(
+        "연료전지시스템"
+    )
+    assert entity_resolution._normalize_name("GC/FID") != entity_resolution._normalize_name(
+        "GC/FID/TCD"
+    )
+
+
+def test_find_normalized_duplicates_groups_spacing_variants():
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    graph_manager.upsert_entity(C, "연료전지 시스템", "OBJECT", "개발 대상")
+    graph_manager.upsert_entity(C, "연료전지시스템", "OBJECT", "평가 대상")
+    graph_manager.upsert_entity(C, "고양이", "OTHER", "동물")
+
+    pairs = entity_resolution.find_normalized_duplicates(C)
+
+    assert len(pairs) == 1
+    keep, drop = pairs[0]
+    assert {keep, drop} == {"연료전지 시스템", "연료전지시스템"}
+    assert all("고양이" not in pair for pair in pairs)
+
+
+def test_find_normalized_duplicates_keeps_most_connected_node():
+    # 연결이 많은(중심적인) 노드가 보존되고, 덜 연결된 표기가 그쪽으로 합쳐져야 한다.
+    # (띄어쓰기만 다른 같은 키. 연결을 더 적게 가진 표기여도 degree가 높으면 보존된다.)
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    graph_manager.upsert_entity(C, "연료전지 시스템", "OBJECT", "개발 대상")
+    graph_manager.upsert_entity(C, "연료전지시스템", "OBJECT", "평가 대상")
+    graph_manager.upsert_entity(C, "연구원", "PERSON", "연구자")
+    # 띄어쓰기 없는 '연료전지시스템'에만 관계를 달아 연결 수를 높인다.
+    graph_manager.upsert_relation(C, "연구원", "연료전지시스템", "DEVELOPED", "", "doc1")
+
+    pairs = entity_resolution.find_normalized_duplicates(C)
+
+    assert pairs == [("연료전지시스템", "연료전지 시스템")]
+
+
+def test_run_merges_normalized_variants_without_embedding(monkeypatch):
+    # 표기만 다른 중복은 임베딩 호출 없이도 정규화 단계에서 병합돼야 한다.
+    def boom(texts):
+        raise AssertionError("정규화 병합은 임베딩을 호출하면 안 된다")
+
+    monkeypatch.setattr(entity_resolution, "embed_texts", boom)
+    monkeypatch.setattr(entity_resolution.backup_db, "create_backup", lambda: None)
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    graph_manager.upsert_entity(C, "한국가스안전공사", "ORGANIZATION", "공공기관")
+    graph_manager.upsert_entity(C, "한국 가스안전공사", "ORGANIZATION", "안전 기관")
+
+    entity_resolution.run([C])
+
+    names = {e["name"] for e in graph_manager.get_all_entities([C])}
+    assert names == {"한국가스안전공사"}
+
+
 def test_merge_records_dropped_name_as_alias(monkeypatch):
     # 병합으로 사라진 이름이 살아남은 엔티티의 alias로 남아야, 다음에 같은 표현이
     # 또 나왔을 때 느린 임베딩 비교 없이 즉시 같은 엔티티로 인식할 수 있다.

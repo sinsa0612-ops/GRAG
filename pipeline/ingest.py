@@ -36,6 +36,13 @@ _EXTRACTION_PROMPT = """\
 valid_from처럼 날짜/시점 정보는 텍스트에 명시적으로 적혀 있을 때만 채우고,
 적혀 있지 않으면 절대 추측하지 말고 빈 문자열("")로 남겨줘.
 
+추출 품질 규칙(꼭 지켜):
+- 순수 식별자·코드·수치만으로 된 것은 엔티티로 만들지 마. 예: 특허번호(10-2125457), 과제·공고번호(RS-2026-..., 제2026-71호), 사업자/법인등록번호, 전화번호, 주소 전체. 이런 건 관련 엔티티의 description에 녹여 적어.
+- 엔티티 이름(name)은 가장 짧은 표준 명칭으로 적어. 과제명·논문제목·문장 전체를 통째로 이름으로 쓰지 마(예: "20kW급 잠수함용 연료전지 시스템" 같은 핵심어로 줄여).
+- 같은 대상은 표기를 통일해. 띄어쓰기·괄호만 다르게 새로 만들지 마(예: "연료전지 시스템"과 "연료전지시스템"을 따로 만들지 말 것).
+- RELATED_TO는 마땅한 구체 관계가 없을 때만 최후의 수단으로 써. 가능하면 구체적인 predicate를 골라.
+- 단지 같은 목록/표에 함께 등장한다는 이유만으로 장비·도구를 주제(예: 연료전지)에 CREATED/PRODUCES로 잇지 마. 텍스트가 실제로 그 행위를 말할 때만 관계를 만들어.
+
 예시)
 입력: "홍길동은 2020년부터 OO전자에 다녔다."
 출력: {{"entities": [{{"name": "홍길동", "type": "PERSON", "description": "OO전자 직원"}}, \
@@ -147,7 +154,9 @@ def process_file(file_path: Path, collection: str) -> bool:
         return False
 
     source_id = document_store.prepare_replacement(file_name)
-    chunks = document_store.chunk_text(content, settings.chunk_size, settings.chunk_overlap)
+    # 변경 감지/원본 보존은 raw(content)로 끝냈으니, 청킹·임베딩·추출 입력만 표 노이즈를 걷어낸 정리본으로 쓴다.
+    cleaned = document_store.clean_markdown(content)
+    chunks = document_store.chunk_text(cleaned, settings.chunk_size, settings.chunk_overlap)
     # 청크마다 LLM 호출 1번이 나가므로, 청크 수만큼 오늘 사용량에 기록한다(RPD 추적).
     sqlite_manager.record_api_usage(len(chunks))
     vector_manager.add_chunks(source_id, chunks, collection)
