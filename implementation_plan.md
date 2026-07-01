@@ -1,33 +1,40 @@
-# 구현 계획서 — 품질평가 하네스(BenchmarkQED-lite: AutoQ + AutoE)
+# implementation_plan.md — retrieval/답변 합성 개선 (top_k + 벡터→그래프 브릿지)
 
-> 직전(모델 토글·gleaning) 계획을 본 작업으로 덮어씀. 직전 내역은 walkthrough.md/HANDOFF-sub.md·git에 보존.
+> 2026-07-01 세션. HANDOFF-main "다음 후보"의 retrieval 트랙. 직전(eval 하네스) 계획은 walkthrough.md/HANDOFF-sub.md·git에 보존.
+> 사용자 승인: 범위=(1)+(2), 구현 후 즉시 eval 재측정.
 
-## 1. 목적
-- 지금까지 추출 '수'(엔티티/관계 수·RELATED_TO 비율)로만 보던 품질을, **실제 Q&A 답변 품질**로 상대 비교할 수 있게 한다.
-- MS BenchmarkQED의 아이디어만 경량 자체 구현(패키지 도입 X — OpenAI 전제·무거움·우리 query와 불일치).
+## 배경 / 문제
+- M4 `eval` 실측(캐럴-flash 단순 vs 캐럴-gemma-glean1 풍부): B 2승·**4무**·A 0승. 4무는 전부 "둘 다 정보 부족".
+- **근본 원인:** `query._gather_graph_context`가 **엔티티 이름이 질문 문자열에 글자 그대로 있을 때만**(`name in question`) 그래프를 끌어온다. 벡터가 관련 본문을 찾아도 그 본문 속 엔티티는 그래프 조회를 트리거하지 않는다. → 추출을 2.5배 풍부하게 해도, 질문에 이름이 안 적히면 그 풍부함이 답변에 못 닿는다. 병목은 추출량이 아니라 retrieval.
 
-## 2. 구조 사전 이해 보고서 (3줄)
-1. **현재:** `query.answer_question(q, collections)`가 그래프+벡터 근거로 답을 만든다. 두 컬렉션을 같은 질문으로 답하게 하면 '추출 품질 → 답변 품질' 영향을 비교할 수 있다.
-2. **데이터 흐름:** AutoQ(발췌→질문 n개) → 각 질문을 컬렉션 A·B로 답변(`answer_question`) → AutoE(LLM 페어와이즈 심판, 순서 뒤집어 2회 → 일치할 때만 승자) → 승패 집계. DB 쓰기 없음(읽기+LLM만).
-3. **정석:** 새 얇은 모듈 `evaluate.py` + `graphrag eval` 서브커맨드. 기존 어댑터·query 재사용, 스키마/DB 무변경. flash 기반·순차(콜 빠름 + Kuzu 동시읽기 회피).
+## 구조 사전 이해 보고서 (3줄) — 사용자 확답 완료
+1. **근본 원인:** 그래프 컨텍스트가 '질문 문자열에 엔티티 이름이 그대로 등장'할 때만 열려, 풍부한 추출이 답변에 도달하지 못함.
+2. **데이터 흐름/규칙:** `answer_question`은 DAL·어댑터의 기존 함수만 조립하는 오케스트레이션. DB 스키마·인터페이스·Pydantic 계약 무변경. `top_k=8`은 함수 기본값 하드코딩(§2-1 위반 소지).
+3. **정석:** (1) `top_k` 설정화·상향, (2) 벡터로 찾은 본문 속 엔티티도 그래프로 끌어오는 브릿지. 폭발 반경 = `query.py`+`config.py`.
 
-## 3. 설계
-- `evaluate.py`:
-  - `generate_questions(sample, n, model)` — 발췌로 질문 n개(구체+종합 혼합) 생성, JSON 배열 파싱(+줄단위 폴백).
-  - `judge_pairwise(q, ans_a, ans_b, model)` — 순서 A→1/B→1 **두 번** 심판, 두 결과가 일치할 때만 승자(위치 편향 제거), 불일치=무승부.
-  - `compare_collections(coll_a, coll_b, questions, judge_model)` — 질문마다 A·B 답변 + 심판, 승패 집계.
-- `graphrag_cli.py`: `cmd_eval` + `graphrag eval --a A --b B [--questions N] [--source 파일] [--model M]`. `--source` 없으면 A의 엔티티로 발췌 구성.
-- 심판/질문 모델 기본=설정 기본(flash). 답변은 `answer_question`의 기본 모델.
+## 구현
+### (1) top_k 설정화·상향 — `config.py`
+- `retrieval_top_k: int = 12` 신설(기존 하드코딩 8 제거, 설정 중앙화 §2-1 준수).
+- `graph_context_max_entities: int = 20` 신설 — 본문 매칭으로 그래프가 폭주하지 않게 상한(질문 매칭 우선 보존 후 채움).
 
-## 4. 영향 파일
-- 신규: `evaluate.py`, `tests/test_evaluate.py`.
-- 수정: `graphrag_cli.py`(서브커맨드), `USAGE.md`(eval 설명).
+### (2) 벡터→그래프 브릿지 — `query.py`
+- `_gather_graph_context(question, collections=None, extra_text="")` — `extra_text` 옵션 추가.
+  - 질문에 직접 등장한 엔티티(`name in question`)를 **우선** 수집(기존 동작 = `extra_text=""`일 때 그대로).
+  - 그다음 `extra_text`(벡터 청크)에 등장한 엔티티를 보강. 단 **한 글자 이름은 제외**(`len(name) >= 2`, 본문 substring 오탐 억제).
+  - 총합 `graph_context_max_entities`로 상한. 이후 브릿지·관계 표면화 로직은 기존과 동일(matched_set 재사용).
+- `_gather_vector_context` 제거 → `answer_question`에서 `query_similar`를 1회 호출해 청크를 얻고, (a) 벡터 컨텍스트 문자열, (b) 그래프 매칭용 `extra_text`로 재사용.
+- `answer_question(question, collections=None, top_k=None)` — `top_k` 미지정 시 `settings.retrieval_top_k`.
 
-## 5. 검증
-- `pytest`: 질문 파싱(JSON/폴백), 심판 위치 매핑(일치=승자/뒤바뀜=무), 집계.
-- 라이브 스모크: `graphrag eval --a 캐럴-flash --b 캐럴-gemma-glean1 --questions 6 --source "processed/크리스마스 캐럴.md"` (flash, ~25콜).
+## 영향 파일
+- 수정: `config.py`, `query.py`, `tests/test_query.py`.
+- 문서: `implementation_plan.md`, `walkthrough.md`, `HANDOFF-sub.md`.
+- scratchpad(비커밋): eval 재측정 스크립트.
 
-## 6. 한계/비고
-- LLM 심판은 편향 존재(순서 2회로 위치편향만 완화). 무료 flash 심판이라 절대평가 아닌 '일관된 상대비교'로 사용.
-- 비용 있음(질문+답변×2+심판×2) → 소수 질문으로 가끔 실행.
-- 후속(옵션): `answer_question`에 model 인자 → '답변 모델' 비교, 병렬화(속도), R1 프롬프트 자동튠과 결합한 튠→측정 루프.
+## 검증
+- 기존 `test_query.py` 5개 하위호환(전부 `extra_text` 미지정 = 옛 동작).
+- 신규 테스트: ①본문 청크 엔티티가 그래프로 표면화 ②한 글자 이름 제외 ③`top_k=None`→설정값 호출.
+- `pytest` 전체 green 확인.
+- **eval 재측정(scratchpad, 비커밋):** `extra_text=""`·`top_k=8`(개선 전) vs 신 경로(개선 후)를 같은 컬렉션·같은 질문으로 `judge_pairwise` → 실제 리프트 수치화. 오늘 잔여 한도 내 소규모(6~8문항).
+
+## 롤백
+- `query.py`·`config.py` 되돌리면 끝(스키마·데이터 변경 없음).

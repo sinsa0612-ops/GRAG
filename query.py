@@ -3,6 +3,7 @@
 import logging
 
 from adapters.llm_adapter import generate
+from config import settings
 from db import graph_manager, sqlite_manager, vector_manager
 
 logger = logging.getLogger(__name__)
@@ -29,17 +30,31 @@ def _append_relations(lines: list[str], collection: str, name: str) -> None:
         lines.append(f"  - {r['source']} -[{r['predicate']}]-> {name}")
 
 
-# 질문 안에 그래프의 기존 엔티티 이름이 등장하면, 그 엔티티의 설명과 양방향 관계를 모은다.
+# 질문(또는 벡터로 찾은 본문 조각)에 그래프의 기존 엔티티 이름이 등장하면, 그 엔티티의 설명과 양방향 관계를 모은다.
 # collections로 범위를 지정하면 그 사업(들)만, None이면 전체 컬렉션을 가로질러 모은다(행정 종합).
+# extra_text: 벡터 검색으로 찾은 본문 조각. 질문에 이름이 안 적혀도 관련 본문에 등장한 엔티티를 그래프로 끌어와,
+#   풍부하게 추출된 그래프가 실제 답변에 도달하게 한다(벡터→그래프 브릿지). 질문 직접 매칭을 항상 우선한다.
 # 교차 인사이트: 매칭 엔티티가 SAME_AS 브릿지로 다른 사업의 같은 대상과 연결돼 있으면(명시적 연결만),
 # '몇 개 사업에 걸쳐 있는지'와 그쪽 사업에서의 관계까지 함께 보여준다. 단순 동명이인은 섞지 않는다.
-def _gather_graph_context(question: str, collections: list[str] | None = None) -> str:
+def _gather_graph_context(
+    question: str, collections: list[str] | None = None, extra_text: str = ""
+) -> str:
     # 같은 이름이 컬렉션마다 따로 있을 수 있으므로 (collection, name) 단위로 매칭한다.
-    matched = [
-        (e["collection"], e["name"])
-        for e in graph_manager.get_all_entities(collections)
-        if e["name"] and e["name"] in question
-    ]
+    # 질문에 직접 등장한 엔티티를 우선하고, 본문 조각(extra_text)에만 등장한 엔티티는 그 뒤에 보강한다.
+    in_question: list[tuple[str, str]] = []
+    in_chunks: list[tuple[str, str]] = []
+    for e in graph_manager.get_all_entities(collections):
+        name = e["name"]
+        if not name:
+            continue
+        if name in question:
+            in_question.append((e["collection"], name))
+        # 한 글자 이름은 본문 substring 매칭에서 오탐이 커 제외한다(질문 직접 매칭에는 기존대로 제한 없음).
+        elif extra_text and len(name) >= 2 and name in extra_text:
+            in_chunks.append((e["collection"], name))
+
+    # 질문 매칭을 먼저 채운 뒤 본문 매칭으로 상한까지 보강한다(그래프 컨텍스트 폭주 방지).
+    matched = (in_question + in_chunks)[: settings.graph_context_max_entities]
 
     if not matched:
         return "(질문과 일치하는 엔티티를 찾지 못함)"
@@ -64,19 +79,18 @@ def _gather_graph_context(question: str, collections: list[str] | None = None) -
     return "\n".join(lines)
 
 
-# 벡터 검색으로 질문과 의미적으로 가까운 본문 조각을 모은다(컬렉션 범위 안에서).
-def _gather_vector_context(question: str, top_k: int = 8, collections: list[str] | None = None) -> str:
-    chunks = vector_manager.query_similar(question, top_k=top_k, collections=collections)
-    if not chunks:
-        return "(관련 본문을 찾지 못함)"
-    return "\n---\n".join(chunks)
-
-
 # 그래프+벡터 정보만 근거로 질문에 답한다.
 # collections=None이면 전체 컬렉션을 종합(행정 종합), 지정하면 그 사업(들) 범위 안에서만 답한다.
-def answer_question(question: str, collections: list[str] | None = None, top_k: int = 8) -> str:
-    graph_context = _gather_graph_context(question, collections)
-    vector_context = _gather_vector_context(question, top_k=top_k, collections=collections)
+# top_k를 주지 않으면 설정값(settings.retrieval_top_k)을 쓴다.
+def answer_question(
+    question: str, collections: list[str] | None = None, top_k: int | None = None
+) -> str:
+    if top_k is None:
+        top_k = settings.retrieval_top_k
+    # 벡터 검색을 먼저 1회 수행해, 찾은 본문 조각을 (a)근거 컨텍스트와 (b)그래프 매칭용 힌트로 함께 쓴다.
+    chunks = vector_manager.query_similar(question, top_k=top_k, collections=collections)
+    vector_context = "\n---\n".join(chunks) if chunks else "(관련 본문을 찾지 못함)"
+    graph_context = _gather_graph_context(question, collections, extra_text=vector_context)
     prompt = _ANSWER_PROMPT.format(
         graph_context=graph_context, vector_context=vector_context, question=question
     )
