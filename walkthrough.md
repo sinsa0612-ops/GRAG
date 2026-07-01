@@ -71,3 +71,49 @@
 
 ### 잔여
 - 전체 재인덱싱은 오늘 한도(380/500 사용) 초과로 **보류** → 리셋 후 1회 실행(`HANDOFF-sub.md`).
+
+## 7. USAGE.md 명령 통합 GUI 확장 — 구현·검증 완료
+
+### 기능 체감
+- `streamlit run app.py`로 **USAGE.md의 모든 graphrag 명령을 마우스로** 실행할 수 있다. 기존 3탭(업로드/그래프/현황) → **7탭**으로 확장돼 질문·초기화·병합·삭제·백업/복원·컬렉션·계층·브릿지·사용량까지 전부 버튼화.
+- 문서 넣기 화면은 처리 전에 **예상 요청 수·오늘 남은 한도**를 보여주고, 한도 초과 시 처리 버튼을 막고 분할을 안내한다(`--force`/`--no-merge` 체크박스 제공).
+- 되돌릴 수 없는 작업(`init --reset`·`delete-collection`·`restore`)은 **확인 체크박스**를 켜야 버튼이 활성화된다.
+
+### 어떻게
+- GUI는 새 로직을 만들지 않고 CLI(`graphrag_cli.py`)가 쓰는 것과 **동일한 함수를 동일 인자로** 호출한다(얇은 프런트엔드). 핵심 로직·DB 스키마·모듈 인터페이스 무변경.
+
+### 변경 파일
+- `app.py`(7탭으로 전면 확장, 기존 3탭 기능 흡수), `USAGE.md` §7(명령 매핑 표), `implementation_plan.md`(계획), `HANDOFF-sub.md`(로그), 본 문서.
+
+### 검증
+- `app.py` AST 파싱 OK.
+- 헤드리스 Streamlit(8501) 기동 → 7탭 렌더, 현황 탭 실데이터(문서 1/청크 378/엔티티 940 — 직전 세션 수치 일치), 문서 넣기 탭 위젯 정상. **앱 코드 유래 예외 0건**(로그의 `transformers…torchvision` 트레이스백은 Streamlit 파일 감시기 잡음, 기능 무관).
+- 백엔드 미변경 + `tests/`가 app.py/streamlit 미임포트 → 기존 `pytest` 135 passed 영향 없음.
+
+### 한계 / 비고
+- 새 의존성 없음(Streamlit 기존 사용). 첫 기동 시 `sentence_transformers`(torch/transformers) 임포트로 수십 초 지연 — 기존 app.py와 동일.
+
+## 8. 모델 토글(Gemma) + gleaning — 구현·검증 완료
+
+### 기능 체감
+- **추출 모델을 바꿀 수 있다:** `generate/extract_chunk/process_file`에 `model` 인자. Gemma처럼 구조화 출력(JSON 스키마)을 지원 안 하는 모델은 어댑터가 자동으로 스키마를 빼고 프롬프트 기반 JSON으로 받는다. 모델별 호출 간격도 자동(Gemma 4.5초/기타 3.0초).
+- **gleaning(`--glean N`, GUI엔 라운드 입력):** 청크마다 놓친 엔티티/관계를 최대 N번 더 캐내 recall을 올린다. 새로 나온 게 없으면 라운드를 조기 종료해 호출을 아끼고, 요청 수는 (1+N)배로 예상·가드에 자동 반영된다. 기본 0=끔(기존 동작 불변).
+
+### flash-lite vs gemma-4-31b-it A/B (크리스마스 캐럴, flash 91청크 / gemma 60청크)
+- **recall:** gemma가 청크당 엔티티 3.0→**7.5**, 관계 5.1→**12.0**(2.4~2.5배). 배경·지명·연도 등 디테일을 훨씬 많이 포착.
+- **품질:** 잡티(번호/긴이름) 0, RELATED_TO 비율 26.7%↔25.9%로 비슷. gemma는 `영국` 같은 과잉 허브 경향(정제 필요).
+- **속도(치명):** flash 6.7초/청크 vs gemma **~75~130초/청크**. gemma는 무료 등급 지속 부하 throttling. 순수 API 왕복(우리 sleep 제외) 실측 74.7s·121.3s → 느림은 **API 자체 지연**이지 우리 호출 간격 설정이 아님(설정은 정상).
+- **결론:** gemma는 recall 우수하나 대형 문서엔 시간 비현실적 → "최대 recall용 배치"로 토글 유지. 일상 recall 향상은 **flash+gleaning**이 현실적.
+
+### 변경 파일
+- `config.py`(gemma 간격·`glean_rounds`), `adapters/llm_adapter.py`(model 인자·스키마/간격 분기), `pipeline/ingest.py`(`glean_chunk`·프롬프트·process_file 배선), `process_inbox.py`(인자 전달), `graphrag_cli.py`(`--glean`·예상/가드 배수), `app.py`(gleaning 입력·배선).
+- 테스트: `tests/test_pipeline_ingest.py`(+3: gleaning 병합·조기종료·process_file).
+
+### 검증
+- `pytest` **139 passed**(기존 135 + gleaning 3 + 필드명 별칭 정규화 1). `--glean 2 --dry-run`: `91청크 × 3 = 273 요청`으로 배수·가드 정확. gemma 스모크: 모델 유효·한국어 정확·무스키마 JSON 파싱 정상.
+
+### gleaning 실증 + 필드명 버그(발견·수정)
+- **실증 리프트:** flash glean1 = 엔티티 +46.3% / 관계 +53.9%(앞 50청크), gemma glean1 = +43.6% / +46.9%(전권 91청크). 두 모델 모두 gleaning으로 ~+45% recall↑, 잡티 거의 없음(flash 0, gemma 날짜성 1건). → gleaning은 모델 무관하게 유효.
+- **버그:** gemma(무스키마)가 gleaning 응답에서 name→id/text/entity, source/target→subject/object로 필드명을 어긋나게 내 검증에서 전부 버려짐(초기 gemma glean이 +0%로 보인 원인). flash는 구조화 출력이 필드명을 강제해 무사.
+- **수정:** `_GLEAN_PROMPT`에 필드명 예시 명시 + `_parse_extraction`에 `_normalize_field_names`(변형 키 흡수, 스키마 불변) + 재현 테스트. 이 버그는 gemma 실제 ingest에서도 gleaning 데이터 ~44%를 조용히 흘렸을 문제라 수정이 중요.
+- **속도:** gemma 전권 91청크 gleaning을 병렬 5워커로 58분(순차 예상 4.5시간, 4.7배↓). gemma 속도의 열쇠는 호출 간격이 아니라 동시 호출.

@@ -61,6 +61,24 @@ def test_parse_extraction_strips_markdown_fence():
     assert result.entities[0].name == "강택리"
 
 
+def test_parse_extraction_normalizes_alias_field_names():
+    # 구조화 출력 미지원 모델(Gemma)이 name 대신 id/text/entity, source/target 대신 subject/object를
+    # 써도 검증에서 버려지지 않고 흡수돼야 한다(실측된 실패 재현).
+    raw = json.dumps(
+        {
+            "entities": [
+                {"id": "여름", "type": "DATE"},
+                {"text": "벽난로", "type": "OBJECT"},
+                {"entity": "영국", "type": "LOCATION"},
+            ],
+            "relations": [{"subject": "스크루지", "predicate": "OWNS", "object": "벽난로"}],
+        }
+    )
+    result = ingest._parse_extraction(raw)
+    assert {e.name for e in result.entities} == {"여름", "벽난로", "영국"}
+    assert (result.relations[0].source, result.relations[0].target) == ("스크루지", "벽난로")
+
+
 def test_extract_chunk_handles_llm_call_failure(monkeypatch):
     def boom(prompt, **kwargs):
         raise RuntimeError("일시적 네트워크 오류")
@@ -222,3 +240,58 @@ def test_store_extraction_merges_known_alias_instead_of_creating_new_node():
 
     names = {e["name"] for e in graph_manager.get_all_entities()}
     assert names == {"ISA계좌"}
+
+
+def test_glean_chunk_merges_missed_and_stops_early(monkeypatch):
+    # gleaning: 1차 결과(A)에 이어 라운드1이 B를 추가하고, 라운드2가 빈 결과면 조기 종료해야 한다.
+    from schemas import ExtractedEntity, ExtractionResult
+
+    base = ExtractionResult(entities=[ExtractedEntity(name="A", type="PERSON", description="")], relations=[])
+    responses = iter(
+        [
+            json.dumps({"entities": [{"name": "B", "type": "PERSON", "description": ""}], "relations": []}),
+            json.dumps({"entities": [], "relations": []}),  # 새로운 게 없음 → 조기 종료
+        ]
+    )
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: next(responses))
+
+    result, extra_calls = ingest.glean_chunk("텍스트", base, rounds=5)
+
+    assert {e.name for e in result.entities} == {"A", "B"}
+    assert extra_calls == 2  # 라운드1(B 추가) + 라운드2(빈 결과, 조기 종료). 라운드3~5는 호출 안 함
+
+
+def test_glean_chunk_dedupes_repeated_entities(monkeypatch):
+    # gleaning 라운드가 이미 있는 이름(A)을 또 내놓아도 중복 노드를 만들지 않고, 새 게 없으니 멈춘다.
+    from schemas import ExtractedEntity, ExtractionResult
+
+    base = ExtractionResult(entities=[ExtractedEntity(name="A", type="PERSON", description="")], relations=[])
+    monkeypatch.setattr(
+        ingest, "generate",
+        lambda prompt, **kwargs: json.dumps({"entities": [{"name": "A", "type": "PERSON", "description": ""}], "relations": []}),
+    )
+
+    result, extra_calls = ingest.glean_chunk("텍스트", base, rounds=3)
+
+    assert [e.name for e in result.entities] == ["A"]  # 중복 없음
+    assert extra_calls == 1  # 첫 라운드에서 새 게 없어 바로 종료
+
+
+def test_process_file_gleaning_adds_missed_entities(tmp_path, monkeypatch):
+    # process_file에 glean_rounds=1을 주면, 1차(에이)에 이어 gleaning이 찾은 비이도 저장돼야 한다.
+    def fake_generate(prompt, **kwargs):
+        if "놓친" in prompt:  # _GLEAN_PROMPT 분기
+            return json.dumps({"entities": [{"name": "비이", "type": "Person", "description": ""}], "relations": []})
+        return json.dumps({"entities": [{"name": "에이", "type": "Person", "description": ""}], "relations": []})
+
+    monkeypatch.setattr(ingest, "generate", fake_generate)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("에이는 사람이다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, glean_rounds=1) is True
+    names = {e["name"] for e in graph_manager.get_all_entities()}
+    assert {"에이", "비이"} <= names

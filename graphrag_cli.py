@@ -67,15 +67,19 @@ def _run_auto_merge(collection: str, args) -> None:
 
 
 # 한도 초과로 차단됐을 때, 문서를 몇 개로 쪼개야 하는지 안내한다.
-def _print_split_guidance(estimates: list[tuple], remaining: int, limit: int) -> None:
+# multiplier는 gleaning으로 청크당 호출이 몇 배가 되는지(1=gleaning 끔)로, 요청 수 환산에 반영한다.
+def _print_split_guidance(estimates: list[tuple], remaining: int, limit: int, multiplier: int = 1) -> None:
     step = max(1, settings.chunk_size - settings.chunk_overlap)
     for path, n in estimates:
-        if n > limit:
-            pieces = math.ceil(n / limit)
-            approx_chars = limit * step
+        eff = n * multiplier
+        if eff > limit:
+            pieces = math.ceil(eff / limit)
+            max_chunks = max(1, limit // multiplier)
+            approx_chars = max_chunks * step
+            cost = f"{n}청크" if multiplier == 1 else f"{n}청크×{multiplier}={eff}요청"
             print(
-                f"  · {path.name}({n}청크)는 하루 한도({limit})를 단독으로 넘습니다 "
-                f"→ 약 {pieces}개로 나눠 각각 넣으세요 (조각당 ≤{limit}청크 ≈ ≤약 {approx_chars:,}자)."
+                f"  · {path.name}({cost})는 하루 한도({limit})를 단독으로 넘습니다 "
+                f"→ 약 {pieces}개로 나눠 각각 넣으세요 (조각당 ≤{max_chunks}청크 ≈ ≤약 {approx_chars:,}자)."
             )
             print(f"    예: {path.stem}-1{path.suffix}, {path.stem}-2{path.suffix} ...")
     if remaining > 0:
@@ -119,14 +123,20 @@ def cmd_ingest(args) -> None:
         (path, document_store.estimate_request_count(path.read_text(encoding="utf-8")))
         for path in targets
     ]
-    total_est = sum(n for _, n in estimates)
+    # gleaning이 켜지면 청크당 최대 (1+glean)회 호출된다 → 예상/한도 계산에 곱해 반영한다.
+    glean = getattr(args, "glean", 0) or 0
+    multiplier = 1 + max(0, glean)
+    total_est = sum(n for _, n in estimates) * multiplier
     used = sqlite_manager.get_api_usage_today()
     limit = settings.llm_daily_limit
     remaining = limit - used
 
     print(f"오늘 사용: {used}/{limit} (남은 한도 {max(0, remaining)})")
+    if glean:
+        print(f"gleaning {glean}라운드 → 청크당 최대 {multiplier}회 호출")
     for path, n in estimates:
-        print(f"  - {path.name}: 예상 {n} 요청")
+        detail = f"{n} 요청" if multiplier == 1 else f"{n}청크 × {multiplier} = {n * multiplier} 요청"
+        print(f"  - {path.name}: 예상 {detail}")
     print(f"이번 작업 합계: {total_est} 요청 → 처리 후 {used + total_est}/{limit}")
 
     if args.dry_run:
@@ -136,19 +146,19 @@ def cmd_ingest(args) -> None:
     # 3) 한도 가드
     if used + total_est > limit and not args.force:
         print(f"\n⛔ 한도 초과 예상: {used} + {total_est} = {used + total_est} > {limit}  — 처리를 중단합니다.")
-        _print_split_guidance(estimates, max(0, remaining), limit)
+        _print_split_guidance(estimates, max(0, remaining), limit, multiplier)
         print("그래도 강행하려면 --force 를 붙이세요.")
         return
 
     # 4) 실제 처리
     if args.inbox:
-        process_inbox.process_inbox(collection)
+        process_inbox.process_inbox(collection, glean_rounds=glean)
         _report_orphan_cleanup()
         _run_auto_merge(collection, args)
         return
     for path, _ in estimates:
         try:
-            changed = ingest.process_file(path, collection)
+            changed = ingest.process_file(path, collection, glean_rounds=glean)
         except Exception as exc:
             failed_dir = settings.failed_dir / collection
             failed_dir.mkdir(parents=True, exist_ok=True)
@@ -350,6 +360,41 @@ def cmd_unset_parent(args) -> None:
     print(f"계층 해제: '{args.child}'")
 
 
+# 두 컬렉션의 답변 품질을 비교한다(질문 자동생성 + LLM 페어와이즈 심판).
+# 추출 '수'가 아니라 실제 Q&A로 어느 쪽 그래프가 더 나은 답을 내는지 상대 비교한다.
+def cmd_eval(args) -> None:
+    import evaluate
+    from db import graph_manager
+
+    # 질문 생성용 발췌: --source가 있으면 원문 앞/중간/끝을 뽑고, 없으면 A 컬렉션의 엔티티로 구성한다.
+    if args.source:
+        text = Path(args.source).read_text(encoding="utf-8")
+        mid = len(text) // 2
+        sample = f"{text[:2500]}\n…\n{text[mid:mid + 2500]}\n…\n{text[-2500:]}"
+    else:
+        entities = graph_manager.get_all_entities([args.a])[:40]
+        sample = "\n".join(
+            f"- {e['name']} ({e.get('type')}): {e.get('description', '')}" for e in entities
+        ) or "(내용 없음)"
+
+    questions = evaluate.generate_questions(sample, n=args.questions, model=args.model)
+    if not questions:
+        print("질문 생성에 실패했습니다.")
+        return
+    print(f"질문 {len(questions)}개 생성:")
+    for question in questions:
+        print(f"  - {question}")
+
+    print(f"\n[{args.a}] vs [{args.b}] 답변·심판 중... (질문당 답변 2회 + 심판 2회)")
+    report = evaluate.compare_collections(args.a, args.b, questions, judge_model=args.model)
+    wins = report["wins"]
+    print(f"\n=== 결과: A=[{args.a}]  B=[{args.b}] ===")
+    print(f"A 승 {wins['A']} · B 승 {wins['B']} · 무 {wins['tie']}  (총 {len(questions)})")
+    for result in report["results"]:
+        print(f"  [{result['winner']}] {result['question']}")
+        print(f"       └ {result['reason']}")
+
+
 # DB 전체를 백업한다.
 def cmd_backup(args) -> None:
     import backup_db
@@ -382,6 +427,10 @@ def main(argv: list[str] | None = None) -> None:
     p_ingest.add_argument("--dry-run", action="store_true", help="처리 없이 예상 요청 수만 표시")
     p_ingest.add_argument("--force", action="store_true", help="하루 한도 초과 예상이어도 강행")
     p_ingest.add_argument("--no-merge", action="store_true", help="처리 후 엔티티 자동 병합을 건너뜀")
+    p_ingest.add_argument(
+        "--glean", type=int, default=0, metavar="N",
+        help="청크당 gleaning(놓친 것 추가 추출) 라운드 수. 요청 수가 최대 (1+N)배로 늘어난다. 기본 0=끔",
+    )
     p_ingest.set_defaults(func=cmd_ingest)
 
     sub.add_parser("usage", help="오늘 LLM 요청 사용량/남은 한도").set_defaults(func=cmd_usage)
@@ -434,6 +483,14 @@ def main(argv: list[str] | None = None) -> None:
     p_unsetparent = sub.add_parser("unset-parent", help="컬렉션 부모 지정 해제")
     p_unsetparent.add_argument("child", help="자식 컬렉션 이름")
     p_unsetparent.set_defaults(func=cmd_unset_parent)
+
+    p_eval = sub.add_parser("eval", help="두 컬렉션의 답변 품질 비교(질문 자동생성 + LLM 심판)")
+    p_eval.add_argument("--a", required=True, help="비교 컬렉션 A")
+    p_eval.add_argument("--b", required=True, help="비교 컬렉션 B")
+    p_eval.add_argument("--questions", type=int, default=8, help="생성할 질문 수(기본 8)")
+    p_eval.add_argument("--source", help="질문 생성용 원문 파일 경로(없으면 A의 엔티티로 생성)")
+    p_eval.add_argument("--model", help="질문 생성·심판에 쓸 모델(기본: 설정 기본 모델)")
+    p_eval.set_defaults(func=cmd_eval)
 
     sub.add_parser("backup", help="DB 백업").set_defaults(func=cmd_backup)
     p_restore = sub.add_parser("restore", help="백업 복원")

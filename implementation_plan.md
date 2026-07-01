@@ -1,58 +1,33 @@
-# 구현 계획서 — 잠수함 문서 추출 품질 개선 (Tier 1~3 + 재인덱싱)
+# 구현 계획서 — 품질평가 하네스(BenchmarkQED-lite: AutoQ + AutoE)
 
-> 직전 M2(컬렉션 유기적 고도화) 계획서를 본 작업 계획으로 덮어씀.
-> M2 설계는 `HANDOFF-main.md` 마일스톤과 git 이력에 보존되어 있음.
+> 직전(모델 토글·gleaning) 계획을 본 작업으로 덮어씀. 직전 내역은 walkthrough.md/HANDOFF-sub.md·git에 보존.
 
-## 1. 목적 / 배경
-- `잠수함 기술개발` 컬렉션 1건(연구개발계획서, 57.8만 자)의 추출 품질을 개선한다.
-- 실측 진단: 엔티티 989 / 관계 2183. 양은 충분하나 **파편화·잡티·미연결**로 밀도가 희석됨.
-  - 핵심 주제 "연료전지"가 4개 노드로 분할(연결 129/98/69/31).
-  - `merge` 미실행(alias 0/989)이고, **실행해도** 현재 방식(이름+설명 임베딩, 0.92)으로는 파편이 안 합쳐짐(측정값: '연료전지 시스템'~'연료전지시스템' 0.830).
-  - 잡티 엔티티 ~151개(특허번호 `10-21xxxxx`, 과제코드 `RS-2026-...`, 주소·제목 통째).
-  - 과잉 허브(홍스웍스 202), 장비→연료전지 `CREATED` 오연결, `RELATED_TO` 286건(13%).
-  - 원본 표 노이즈 51%(빈 셀) → 정리 시 청크 ~370→~180(LLM 호출·비용 절반).
-- 제약 준수: **가성비 추출 유지(청크당 1회·무료 Flash-lite), LangChain 미도입, KISS, 격벽 불변.**
+## 1. 목적
+- 지금까지 추출 '수'(엔티티/관계 수·RELATED_TO 비율)로만 보던 품질을, **실제 Q&A 답변 품질**로 상대 비교할 수 있게 한다.
+- MS BenchmarkQED의 아이디어만 경량 자체 구현(패키지 도입 X — OpenAI 전제·무거움·우리 query와 불일치).
 
 ## 2. 구조 사전 이해 보고서 (3줄)
-1. **근본 원인:** ①추출 프롬프트가 식별자/긴제목/약한관계를 거르지 않음 ②`merge`의 임베딩 입력에 설명문이 섞여 같은 대상이 매번 다른 설명을 받아 유사도가 깎임 ③원본 표 노이즈가 청크 예산을 절반 잡아먹어 추출 집중도↓.
-2. **데이터 흐름:** `process_file`(raw 해시/저장은 그대로) → **신규 전처리(표 정리)** → `chunk_text` → `extract_chunk`(프롬프트 보강) → 저장. ingest 종료 후 **`merge` 자동 1회**. DB 스키마·격벽·RELATION 질의·백업 경로 **무변경**.
-3. **정석 해결:** 프롬프트(가성비 트랙), 병합 로직(이름기준+무료 정규화병합), 전처리(순수 정규식·외부라이브러리 없음→어댑터 불요, document_store에 귀속)만 손대고 폭발 반경 최소화.
+1. **현재:** `query.answer_question(q, collections)`가 그래프+벡터 근거로 답을 만든다. 두 컬렉션을 같은 질문으로 답하게 하면 '추출 품질 → 답변 품질' 영향을 비교할 수 있다.
+2. **데이터 흐름:** AutoQ(발췌→질문 n개) → 각 질문을 컬렉션 A·B로 답변(`answer_question`) → AutoE(LLM 페어와이즈 심판, 순서 뒤집어 2회 → 일치할 때만 승자) → 승패 집계. DB 쓰기 없음(읽기+LLM만).
+3. **정석:** 새 얇은 모듈 `evaluate.py` + `graphrag eval` 서브커맨드. 기존 어댑터·query 재사용, 스키마/DB 무변경. flash 기반·순차(콜 빠름 + Kuzu 동시읽기 회피).
 
 ## 3. 설계
-
-### Tier 1 — 추출 프롬프트 보강 (`pipeline/ingest.py`)
-`_EXTRACTION_PROMPT`에 규칙 추가(문자열만 변경, 로직 무변경):
-- 순수 식별자/코드/수치 단독은 엔티티 금지: 특허번호(`10-2125457`), 과제·공고번호(`RS-...`, `제2026-71호`), 사업자/법인등록번호, 전화번호, 주소 전체.
-- 엔티티 이름은 **가장 짧은 표준 명칭**으로. 과제명·논문제목·문장 전체를 이름으로 쓰지 말 것.
-- `RELATED_TO`는 마땅한 구체 관계가 없을 때만 최후로. 가능하면 구체 predicate 선택.
-- 단지 같은 목록/표에 함께 등장한다는 이유로 장비·도구를 주제(예: 연료전지)에 `CREATED/PRODUCES`로 잇지 말 것(텍스트가 그 행위를 말할 때만).
-
-### Tier 2 — 병합 로직 보강 (`pipeline/entity_resolution.py`, `db/graph_manager.py`)
-- **(a) 무료 정규화 병합(신규, 임베딩 불요):** 이름을 정규화(공백·구두점 제거 + 소문자)했을 때 충돌하는 노드들을 한 그룹으로 병합. `연료전지 시스템`=`연료전지시스템` 즉시 해결. 안전: 알파벳·기호 구성이 동일한 경우에만 합치므로 `GC/FID`≠`GC/FID/TCD`는 안 합쳐짐. blacklist 존중, 보존 노드=연결수 최다(동률 시 최단 이름).
-- **(b) 임베딩 입력에서 설명문 제외:** `find_merge_candidates`가 `name: description` 대신 **이름만** 임베딩(측정상 이름만일 때 '연료전지 시스템'~'연료전지시스템' 0.984로 회수됨). 임계값 0.92 유지(이름만 0.92는 오병합 방어에 충분).
-- **(c) ingest 종료 후 자동 병합:** `cmd_ingest`가 처리 후 해당 컬렉션에 `entity_resolution.run([collection])` 1회 호출(임베딩 로컬=추가 비용 0). `--no-merge`로 끌 수 있게.
-- 의미상 병합이 필요하나 위험한 부분집합 쌍(`연료전지`⊂`연료전지 시스템`, `공기`⊂`공기밸브류`)은 **자동 병합하지 않음**(오병합 위험). 기존 수동 `merge`/blacklist로 처리.
-
-### Tier 3 — 마크다운 표 노이즈 전처리 (`db/document_store.py`)
-- 신규 `clean_markdown(content)`: 빈 표줄/구분선(`|---|`) 제거, 표 행은 비어있지 않은 셀만 공백 join, 3줄 이상 빈 줄 압축.
-- **호출 위치:** `process_file`에서 `chunk_text` 직전 + `estimate_request_count`(예상치=실제 일치). **해시·원본 저장은 raw 그대로**(변경 감지 정확성 유지). 청크/임베딩/추출만 정리본 사용.
-- 외부 라이브러리 없음(순수 `re`) → 어댑터 불요, `chunk_text`와 같은 모듈에 귀속(기존 `chunk_text` 시그니처·테스트 불변).
-
-### 재인덱싱 (코드 변경 후 1회)
-1. `backup_db.py`로 안전 백업.
-2. `graphrag delete-collection "잠수함 기술개발"`(그래프+벡터+문서기록 제거).
-3. `graphrag ingest "processed/잠수함 기술개발/잠수함 사업계획서.md" --collection "잠수함 기술개발"`(자동 병합 포함).
-4. `db_status.py`로 before/after 비교(엔티티·관계·고립·잡티 수).
+- `evaluate.py`:
+  - `generate_questions(sample, n, model)` — 발췌로 질문 n개(구체+종합 혼합) 생성, JSON 배열 파싱(+줄단위 폴백).
+  - `judge_pairwise(q, ans_a, ans_b, model)` — 순서 A→1/B→1 **두 번** 심판, 두 결과가 일치할 때만 승자(위치 편향 제거), 불일치=무승부.
+  - `compare_collections(coll_a, coll_b, questions, judge_model)` — 질문마다 A·B 답변 + 심판, 승패 집계.
+- `graphrag_cli.py`: `cmd_eval` + `graphrag eval --a A --b B [--questions N] [--source 파일] [--model M]`. `--source` 없으면 A의 엔티티로 발췌 구성.
+- 심판/질문 모델 기본=설정 기본(flash). 답변은 `answer_question`의 기본 모델.
 
 ## 4. 영향 파일
-- 코드: `pipeline/ingest.py`(프롬프트), `pipeline/entity_resolution.py`(정규화병합·이름임베딩), `db/graph_manager.py`(정규화병합 helper, 필요시), `db/document_store.py`(clean_markdown), `graphrag_cli.py`(자동병합 훅·`--no-merge`).
-- 테스트: `test_pipeline_ingest.py`, `test_entity_resolution.py`, `test_document_store.py`(clean_markdown), `test_graphrag_cli.py`.
+- 신규: `evaluate.py`, `tests/test_evaluate.py`.
+- 수정: `graphrag_cli.py`(서브커맨드), `USAGE.md`(eval 설명).
 
 ## 5. 검증
-- `pytest` 전체 그린 + 신규 케이스(정규화병합/clean_markdown/프롬프트 가드).
-- 스모크: 재인덱싱 후 `db_status`에서 엔티티 수 감소(파편 병합)·잡티 감소·연료전지 단일 허브화 확인.
+- `pytest`: 질문 파싱(JSON/폴백), 심판 위치 매핑(일치=승자/뒤바뀜=무), 집계.
+- 라이브 스모크: `graphrag eval --a 캐럴-flash --b 캐럴-gemma-glean1 --questions 6 --source "processed/크리스마스 캐럴.md"` (flash, ~25콜).
 
-## 6. 알려진 한계(허용)
-- 부분집합형 의미 병합은 자동화 안 함(오병합 위험) — 수동 `merge`/`bridge`로.
-- 표 전처리는 휴리스틱(완벽한 표 의미 복원 아님) — 목적은 노이즈 제거·집중도 향상.
-- 재인덱싱 LLM 호출 ~180회(하루 한도 500 내).
+## 6. 한계/비고
+- LLM 심판은 편향 존재(순서 2회로 위치편향만 완화). 무료 flash 심판이라 절대평가 아닌 '일관된 상대비교'로 사용.
+- 비용 있음(질문+답변×2+심판×2) → 소수 질문으로 가끔 실행.
+- 후속(옵션): `answer_question`에 model 인자 → '답변 모델' 비교, 병렬화(속도), R1 프롬프트 자동튠과 결합한 튠→측정 루프.

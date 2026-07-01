@@ -49,6 +49,8 @@ valid_from처럼 날짜/시점 정보는 텍스트에 명시적으로 적혀 있
 {{"name": "OO전자", "type": "ORGANIZATION", "description": "홍길동이 다닌 회사"}}], \
 "relations": [{{"source": "홍길동", "target": "OO전자", "predicate": "WORKS_AT", "valid_from": "2020"}}]}}
 
+출력은 위 예시처럼 순수 JSON 객체 하나만 적어. 코드펜스(```)·설명·앞뒤 문장을 붙이지 마.
+
 텍스트:
 {chunk}
 """
@@ -59,6 +61,27 @@ _VOCAB_HINT = """\
 - 기존 엔티티 이름: {names}
 - 기존 관계 이름: {predicates}
 
+"""
+
+# gleaning 라운드용 프롬프트 — 1차 추출에서 놓친 엔티티/관계만 추가로 캐낸다.
+# 필드명(name/source/target …)을 예시로 못 박는다 — 구조화 출력 미지원 모델(Gemma)이 스키마 강제 없이
+# id/text/subject 같은 딴 키로 응답해 검증에서 통째로 버려지는 것을 막기 위함.
+_GLEAN_PROMPT = """\
+아래 텍스트에서 [이미 찾은 엔티티]에 없는, 놓친 중요한 엔티티와 관계만 추가로 추출해.
+이미 목록에 있는 것은 다시 넣지 마. 놓친 게 없으면 entities/relations를 빈 배열([])로 둬.
+엔티티 type은 아래 목록 중 하나만 대문자 그대로. 애매하면 OTHER:
+{allowed_types}
+predicate는 영어 대문자 스네이크케이스. 가능하면 다음을 먼저 재사용: {seed_predicates}
+반드시 아래 필드명을 그대로 써 — 엔티티는 name/type/description, 관계는 source/target/predicate/valid_from.
+출력은 순수 JSON 객체 하나만(코드펜스·설명·앞뒤 문장 금지). 예:
+{{"entities": [{{"name": "홍길동", "type": "PERSON", "description": "설명"}}], \
+"relations": [{{"source": "홍길동", "target": "OO전자", "predicate": "WORKS_AT", "valid_from": ""}}]}}
+
+[이미 찾은 엔티티]
+{found_names}
+
+텍스트:
+{chunk}
 """
 
 
@@ -84,25 +107,63 @@ def _build_prompt(
     )
 
 
+# 구조화 출력 미지원 모델(Gemma 등)이 표준 키 대신 흔히 쓰는 변형 키를 표준 키로 되돌린다.
+# 표준 키가 없을 때만 변형 키 값을 채워 넣으므로 스키마(response_schema)는 건드리지 않고 파싱만 견고해진다.
+# (예: 엔티티 id/text/entity/label -> name, 관계 subject/from -> source, object/to -> target)
+_ENTITY_NAME_ALIASES = ("id", "text", "entity", "label")
+_REL_SOURCE_ALIASES = ("subject", "from")
+_REL_TARGET_ALIASES = ("object", "to")
+
+
+# entities/relations 딕셔너리들의 키를 표준 키로 정규화한다(입구 검증 직전 방어).
+def _normalize_field_names(data: dict) -> dict:
+    for entity in data.get("entities") or []:
+        if isinstance(entity, dict) and "name" not in entity:
+            for alias in _ENTITY_NAME_ALIASES:
+                if alias in entity:
+                    entity["name"] = entity[alias]
+                    break
+    for relation in data.get("relations") or []:
+        if not isinstance(relation, dict):
+            continue
+        if "source" not in relation:
+            for alias in _REL_SOURCE_ALIASES:
+                if alias in relation:
+                    relation["source"] = relation[alias]
+                    break
+        if "target" not in relation:
+            for alias in _REL_TARGET_ALIASES:
+                if alias in relation:
+                    relation["target"] = relation[alias]
+                    break
+    return data
+
+
 # LLM 원시 응답 문자열을 파싱하고 Pydantic으로 검증한다 (입구 검증).
 def _parse_extraction(raw_text: str) -> ExtractionResult:
     cleaned = raw_text.replace("```json", "").replace("```", "").strip()
     data = json.loads(cleaned)
+    if isinstance(data, dict):
+        data = _normalize_field_names(data)
     return ExtractionResult.model_validate(data)
 
 
 # 청크 하나를 LLM에 보내 엔티티/관계를 추출한다.
-# JSON 모드로 호출해 스키마에 맞는 순수 JSON을 받는다(파싱 안정성↑).
+# JSON 모드로 호출해 스키마에 맞는 순수 JSON을 받는다(파싱 안정성↑). 구조화 출력 미지원 모델(Gemma)은
+# 어댑터가 스키마를 빼고 프롬프트 기반 JSON으로 받는다 — 그 경우에도 아래 파서가 동일하게 처리한다.
+# model로 호출 모델을 바꿀 수 있다(없으면 설정 기본 모델).
 # 호출 실패(네트워크/API 오류)나 검증 실패 모두 이 청크만 건너뛰고, 다른 청크 처리를 막지 않는다.
 def extract_chunk(
     chunk: str,
     known_names: list[str] | None = None,
     known_predicates: list[str] | None = None,
+    model: str | None = None,
 ) -> ExtractionResult | None:
     try:
         raw_text = generate(
             _build_prompt(chunk, known_names or [], known_predicates or []),
             response_schema=ExtractionResult,
+            model=model,
         )
     except Exception as exc:
         logger.error("LLM 호출 실패, 이 청크는 건너뜀: %s", exc)
@@ -113,6 +174,50 @@ def extract_chunk(
     except (json.JSONDecodeError, ValidationError) as exc:
         logger.warning("LLM 추출 결과 검증 실패, 이 청크는 건너뜀: %s", exc)
         return None
+
+
+# 한 청크의 1차 추출 결과(base)에 이어, 놓친 엔티티/관계를 rounds회 더 캐내 누적한다(MS GraphRAG의 gleaning).
+# 라운드마다 '이미 찾은 엔티티'를 알려주고 놓친 것만 요청하며, 새로 나온 게 없으면 조기 종료해 호출을 아낀다.
+# 반환: (누적 결과, 실제로 추가 소비한 LLM 호출 수).
+def glean_chunk(
+    chunk: str,
+    base: ExtractionResult,
+    rounds: int,
+    model: str | None = None,
+) -> tuple[ExtractionResult, int]:
+    entities = {e.name: e for e in base.entities}  # 이름 기준 dedupe
+    relations = {(r.source, r.predicate, r.target): r for r in base.relations}
+    extra_calls = 0
+    for _ in range(max(0, rounds)):
+        found_names = ", ".join(entities.keys()) or "(없음)"
+        prompt = _GLEAN_PROMPT.format(
+            allowed_types=_ALLOWED_TYPES,
+            seed_predicates=_SEED_PREDICATES,
+            found_names=found_names,
+            chunk=chunk,
+        )
+        extra_calls += 1
+        try:
+            extra = _parse_extraction(generate(prompt, response_schema=ExtractionResult, model=model))
+        except Exception as exc:
+            logger.warning("gleaning 라운드 실패, 이 라운드는 건너뜀: %s", exc)
+            break
+        added = 0
+        for entity in extra.entities:
+            if entity.name not in entities:
+                entities[entity.name] = entity
+                added += 1
+        for relation in extra.relations:
+            key = (relation.source, relation.predicate, relation.target)
+            if key not in relations:
+                relations[key] = relation
+                added += 1
+        if added == 0:
+            break  # 더 나올 게 없으면 조기 종료(불필요한 호출 방지)
+    return (
+        ExtractionResult(entities=list(entities.values()), relations=list(relations.values())),
+        extra_calls,
+    )
 
 
 # name이 그 컬렉션의 기존 엔티티 정식 이름/alias와 정확히 일치하면 그 정식 이름으로 치환한다.
@@ -144,7 +249,10 @@ def store_extraction(collection: str, result: ExtractionResult, source_doc: str)
 
 
 # 파일 하나를 지정한 컬렉션(사업)으로 끝까지 처리한다 (변경 없으면 False, 처리했으면 True를 반환).
-def process_file(file_path: Path, collection: str) -> bool:
+# model로 추출 LLM 모델을, glean_rounds로 청크당 gleaning 라운드 수를 바꿀 수 있다(둘 다 없으면 설정 기본값).
+def process_file(
+    file_path: Path, collection: str, model: str | None = None, glean_rounds: int | None = None
+) -> bool:
     content = file_path.read_text(encoding="utf-8")
     file_name = file_path.name
     content_hash = document_store.compute_hash(content)
@@ -157,10 +265,14 @@ def process_file(file_path: Path, collection: str) -> bool:
     # 변경 감지/원본 보존은 raw(content)로 끝냈으니, 청킹·임베딩·추출 입력만 표 노이즈를 걷어낸 정리본으로 쓴다.
     cleaned = document_store.clean_markdown(content)
     chunks = document_store.chunk_text(cleaned, settings.chunk_size, settings.chunk_overlap)
-    # 청크마다 LLM 호출 1번이 나가므로, 청크 수만큼 오늘 사용량에 기록한다(RPD 추적).
+    # gleaning 라운드 수 결정(인자 우선, 없으면 설정값).
+    rounds = settings.glean_rounds if glean_rounds is None else glean_rounds
+    # 청크마다 1차 LLM 호출 1번이 나가므로, 청크 수만큼 오늘 사용량에 기록한다(RPD 추적).
+    # gleaning 추가 호출은 실제 소비한 만큼 아래에서 따로 더한다.
     sqlite_manager.record_api_usage(len(chunks))
     vector_manager.add_chunks(source_id, chunks, collection)
 
+    extra_calls = 0
     for chunk in chunks:
         # 청크마다 매번 새로 가져온다 — 같은 문서를 처리하는 중에도 앞 청크가 막 만든
         # 엔티티/관계 이름을 뒤 청크가 못 보면, 한 문서 안에서도 표현이 갈라진다(91청크 실제 검증으로 확인됨).
@@ -168,14 +280,20 @@ def process_file(file_path: Path, collection: str) -> bool:
         known_names = graph_manager.get_known_entity_names([collection])
         known_predicates = graph_manager.get_known_predicates([collection])
 
-        result = extract_chunk(chunk, known_names, known_predicates)
+        result = extract_chunk(chunk, known_names, known_predicates, model=model)
         if result is None:
             continue
+        # gleaning: 놓친 엔티티/관계를 몇 번 더 캐내 누적한다(옵트인, rounds>0일 때만).
+        if rounds > 0:
+            result, calls = glean_chunk(chunk, result, rounds, model=model)
+            extra_calls += calls
         try:
             store_extraction(collection, result, source_id)
         except Exception as exc:
             logger.error("그래프 저장 실패, 이 청크 결과는 건너뜀: %s", exc)
 
+    if extra_calls:
+        sqlite_manager.record_api_usage(extra_calls)  # gleaning으로 추가 소비한 호출 기록
     document_store.commit_document(source_id, collection, file_name, content, content_hash)
     logger.info("[%s] %s 처리 완료 (source_id=%s, 청크 %d개)", collection, file_name, source_id, len(chunks))
     return True

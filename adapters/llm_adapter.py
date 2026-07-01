@@ -31,24 +31,41 @@ def _is_retryable(exc: Exception) -> bool:
     return True  # APIError가 아닌 네트워크 레벨 예외는 일시적일 가능성이 높음
 
 
-# 프롬프트를 Gemini에 전달하고 응답 텍스트를 반환한다.
-# response_schema가 주어지면 JSON 모드로 호출해 스키마에 맞는 순수 JSON 문자열을 받는다(```json 펜스/잡설 없음).
+# 모델이 Gemini의 구조화 출력(response_schema/JSON 모드)을 지원하는지 판단한다.
+# Gemma 계열은 Gemini API에서 구조화 출력을 지원하지 않으므로(스키마를 넘기면 400), 스키마를 빼고
+# 프롬프트 지시로만 순수 JSON을 받아 호출부가 직접 파싱한다.
+def _supports_structured_output(model: str) -> bool:
+    return "gemma" not in model.lower()
+
+
+# 모델별 호출 간격(초)을 고른다. RPM이 더 낮은 Gemma는 더 길게 쉬어 분당 한도를 보호한다.
+def _request_interval(model: str) -> float:
+    if "gemma" in model.lower():
+        return settings.gemma_request_interval_sec
+    return settings.llm_request_interval_sec
+
+
+# 프롬프트를 Gemini/Gemma에 전달하고 응답 텍스트를 반환한다.
+# model을 주면 그 모델로(없으면 설정 기본 모델 llm_model_name), response_schema가 주어지고 그 모델이
+# 구조화 출력을 지원할 때만 JSON 모드로 호출한다(미지원 모델은 프롬프트 기반 JSON으로 받아 호출부가 파싱).
 # 안전필터 등으로 응답이 비면 response.text가 None이라 빈 문자열로 방어한다(호출부의 파싱이 None에서 터지지 않게).
 # 일시적 오류는 설정된 횟수만큼 점진적으로 대기하며 재시도하고, 영구적 오류는 즉시 포기한다.
-# 성공/실패 시도 모두 무료 한도 보호용 대기(llm_request_interval_sec)를 적용한다.
-def generate(prompt: str, response_schema: type | None = None) -> str:
+# 성공/실패 시도 모두 무료 한도 보호용 대기(모델별 간격)를 적용한다.
+def generate(prompt: str, response_schema: type | None = None, model: str | None = None) -> str:
     client = _get_client()
+    model = model or settings.llm_model_name
 
     config = None
-    if response_schema is not None:
+    if response_schema is not None and _supports_structured_output(model):
         config = types.GenerateContentConfig(
             response_mime_type="application/json", response_schema=response_schema
         )
+    interval = _request_interval(model)
 
     for attempt in range(settings.llm_max_retries + 1):
         try:
             response = client.models.generate_content(
-                model=settings.llm_model_name, contents=prompt, config=config
+                model=model, contents=prompt, config=config
             )
             return response.text or ""
         except Exception as exc:
@@ -60,6 +77,6 @@ def generate(prompt: str, response_schema: type | None = None) -> str:
             )
             time.sleep(backoff)
         finally:
-            time.sleep(settings.llm_request_interval_sec)
+            time.sleep(interval)
 
     raise RuntimeError("도달할 수 없는 코드 경로")  # for 루프는 항상 return 또는 raise로 끝난다

@@ -26,11 +26,16 @@ class Settings(BaseSettings):
     # 실측 처리량이 7~9 RPM에 그쳐 한도까지 여유가 있어 4.5초 -> 3.0초로 당겼다.
     # (요청 자체 지연까지 더하면 실효 ~12 RPM 수준이라 15 미만 안전 마진을 유지한다. 429가 보이면 다시 올린다.)
     llm_request_interval_sec: float = 3.0
+    # RPM이 더 낮은 모델(무료 Gemma는 RPM 15)용 호출 간격(초). 15 RPM이면 호출당 4초가 하한이라 4.5초로 안전 마진을 둔다.
+    gemma_request_interval_sec: float = 4.5
     # 일시적 오류(서버 과부하 5xx, 429 한도초과)일 때만 재시도한다. 잘못된 요청/인증 오류는 재시도 안 함.
     llm_max_retries: int = 2
     llm_retry_backoff_sec: float = 5.0
     # Gemini 무료 등급 하루 요청 한도(RPD). 요청 수 = 청크 수라, ingest 전에 초과를 예측·차단하는 데 쓴다.
     llm_daily_limit: int = 500
+    # gleaning: 청크당 '놓친 것 추가 추출' 라운드 수(MS GraphRAG 방식). 0=끔(기본, 청크당 1회 유지).
+    # N>0이면 청크당 최대 (1+N)회 호출 → 요청 수·시간이 그만큼 늘지만 recall(포착량)이 올라간다.
+    glean_rounds: int = 0
     merge_similarity_threshold: float = 0.92
     # 컬렉션을 넘는 same_as 브릿지 '제안'에 쓰는 유사도 임계값. 교차 사업의 같은 대상은 설명이 조금씩
     # 달라 병합 임계값보다 약간 느슨하게 둔다. 제안만 하고 실제 연결은 사용자가 결정한다(자동 연결 아님).
