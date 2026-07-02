@@ -9,14 +9,18 @@ from db import graph_manager, sqlite_manager, vector_manager
 logger = logging.getLogger(__name__)
 
 _ANSWER_PROMPT = """\
-아래 [그래프 정보]와 [관련 본문 조각]만 근거로 질문에 답해.
-거기 없는 내용은 사전 지식이나 추측으로 채우지 말고, 정보가 부족하면 부족하다고 말해.
+아래 [본문 조각]을 1차 근거로, [그래프 힌트]는 보조로만 써서 질문에 답해.
 
-[그래프 정보]
-{graph_context}
+지킬 원칙:
+1. [본문 조각]에 실제로 적혀 있는 내용만 사실로 단정해. 본문에 없으면 사전 지식이나 추측으로 채우지 말고 "정보가 부족하다"고 밝혀.
+2. [그래프 힌트]는 추출된 요약일 뿐 원문이 아니다. 본문과 어긋나면 반드시 본문을 따르고, 그래프에만 있고 본문에 근거가 없는 내용은 사실로 단정하지 마(불확실하면 빼거나 "그래프상"이라고 표시).
+3. 질문에 충실하고 빠짐없이 답하되, 없는 내용을 지어내지 마.
 
-[관련 본문 조각]
+[본문 조각]
 {vector_context}
+
+[그래프 힌트]
+{graph_context}
 
 질문: {question}
 """
@@ -79,6 +83,20 @@ def _gather_graph_context(
     return "\n".join(lines)
 
 
+# 벡터로 찾은 본문 조각을 프롬프트용 컨텍스트 문자열로 만든다.
+# 완전 중복 조각을 제거하고 [본문 N] 번호를 달아, 근거의 경계를 분명히 한다(합성 시 본문 우선 판단을 돕는다).
+def _build_vector_context(chunks: list[str]) -> str:
+    seen: set[str] = set()
+    lines: list[str] = []
+    for chunk in chunks:
+        key = chunk.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"[본문 {len(lines) + 1}] {chunk}")
+    return "\n---\n".join(lines) if lines else "(관련 본문을 찾지 못함)"
+
+
 # 그래프+벡터 정보만 근거로 질문에 답한다.
 # collections=None이면 전체 컬렉션을 종합(행정 종합), 지정하면 그 사업(들) 범위 안에서만 답한다.
 # top_k를 주지 않으면 설정값(settings.retrieval_top_k)을 쓴다.
@@ -89,8 +107,9 @@ def answer_question(
         top_k = settings.retrieval_top_k
     # 벡터 검색을 먼저 1회 수행해, 찾은 본문 조각을 (a)근거 컨텍스트와 (b)그래프 매칭용 힌트로 함께 쓴다.
     chunks = vector_manager.query_similar(question, top_k=top_k, collections=collections)
-    vector_context = "\n---\n".join(chunks) if chunks else "(관련 본문을 찾지 못함)"
-    graph_context = _gather_graph_context(question, collections, extra_text=vector_context)
+    vector_context = _build_vector_context(chunks)
+    # 그래프 매칭(엔티티 substring)에는 라벨이 없는 원문 청크를 넘긴다.
+    graph_context = _gather_graph_context(question, collections, extra_text="\n".join(chunks))
     prompt = _ANSWER_PROMPT.format(
         graph_context=graph_context, vector_context=vector_context, question=question
     )

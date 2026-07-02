@@ -1,40 +1,28 @@
-# implementation_plan.md — retrieval/답변 합성 개선 (top_k + 벡터→그래프 브릿지)
+# implementation_plan.md — retrieval 투자 1차: 답변 합성 충실성 재구성
 
-> 2026-07-01 세션. HANDOFF-main "다음 후보"의 retrieval 트랙. 직전(eval 하네스) 계획은 walkthrough.md/HANDOFF-sub.md·git에 보존.
-> 사용자 승인: 범위=(1)+(2), 구현 후 즉시 eval 재측정.
+> 2026-07-02 세션. 트랙 1(retrieval 투자). 직전(top_k+브릿지, 커밋 574f030) 계획은 walkthrough.md §9·git에 보존.
+> 사용자 승인: "충실성 재구성 + 측정".
 
-## 배경 / 문제
-- M4 `eval` 실측(캐럴-flash 단순 vs 캐럴-gemma-glean1 풍부): B 2승·**4무**·A 0승. 4무는 전부 "둘 다 정보 부족".
-- **근본 원인:** `query._gather_graph_context`가 **엔티티 이름이 질문 문자열에 글자 그대로 있을 때만**(`name in question`) 그래프를 끌어온다. 벡터가 관련 본문을 찾아도 그 본문 속 엔티티는 그래프 조회를 트리거하지 않는다. → 추출을 2.5배 풍부하게 해도, 질문에 이름이 안 적히면 그 풍부함이 답변에 못 닿는다. 병목은 추출량이 아니라 retrieval.
+## 배경 / 문제 (4자 비교 실답변 진단)
+- 답변 합성 품질은 이미 양호하나, **추출이 풍부한 조건에서 그래프발 환각**이 관찰됨:
+  - flash-g1 Q6: "성격은 '아둔한 무기력 덩어리' 같은 난로에 비유"(오귀속, 심판 감점), gemma-g1 Q6: "사무실='물탱크'", "'이쑤시개'·'악귀 군단'".
+- **근본 원인:** `_ANSWER_PROMPT`가 [그래프 정보]와 [본문 조각]을 **대등하게** 제시 → 과잉 추출로 생긴 미검증 그래프 관계를 LLM이 본문과 동급으로 신뢰.
 
 ## 구조 사전 이해 보고서 (3줄) — 사용자 확답 완료
-1. **근본 원인:** 그래프 컨텍스트가 '질문 문자열에 엔티티 이름이 그대로 등장'할 때만 열려, 풍부한 추출이 답변에 도달하지 못함.
-2. **데이터 흐름/규칙:** `answer_question`은 DAL·어댑터의 기존 함수만 조립하는 오케스트레이션. DB 스키마·인터페이스·Pydantic 계약 무변경. `top_k=8`은 함수 기본값 하드코딩(§2-1 위반 소지).
-3. **정석:** (1) `top_k` 설정화·상향, (2) 벡터로 찾은 본문 속 엔티티도 그래프로 끌어오는 브릿지. 폭발 반경 = `query.py`+`config.py`.
+1. **근본 원인:** 프롬프트가 본문과 그래프를 동급으로 둬, 그래프에만 있는(본문 미검증) 주장이 답변에 사실처럼 새어 든다.
+2. **데이터 흐름/규칙:** `query.answer_question` 오케스트레이션만 수정(프롬프트 + 벡터 컨텍스트 구성). DB 스키마·DAL·인터페이스 무변경. 폭발 반경 = `query.py`.
+3. **정석:** 본문(벡터)=1차 근거, 그래프=보조 힌트(충돌 시 본문 우선, 그래프-only 주장 단정 금지)로 프롬프트 재구성 + 벡터 청크 dedup·번호 라벨.
 
-## 구현
-### (1) top_k 설정화·상향 — `config.py`
-- `retrieval_top_k: int = 12` 신설(기존 하드코딩 8 제거, 설정 중앙화 §2-1 준수).
-- `graph_context_max_entities: int = 20` 신설 — 본문 매칭으로 그래프가 폭주하지 않게 상한(질문 매칭 우선 보존 후 채움).
-
-### (2) 벡터→그래프 브릿지 — `query.py`
-- `_gather_graph_context(question, collections=None, extra_text="")` — `extra_text` 옵션 추가.
-  - 질문에 직접 등장한 엔티티(`name in question`)를 **우선** 수집(기존 동작 = `extra_text=""`일 때 그대로).
-  - 그다음 `extra_text`(벡터 청크)에 등장한 엔티티를 보강. 단 **한 글자 이름은 제외**(`len(name) >= 2`, 본문 substring 오탐 억제).
-  - 총합 `graph_context_max_entities`로 상한. 이후 브릿지·관계 표면화 로직은 기존과 동일(matched_set 재사용).
-- `_gather_vector_context` 제거 → `answer_question`에서 `query_similar`를 1회 호출해 청크를 얻고, (a) 벡터 컨텍스트 문자열, (b) 그래프 매칭용 `extra_text`로 재사용.
-- `answer_question(question, collections=None, top_k=None)` — `top_k` 미지정 시 `settings.retrieval_top_k`.
-
-## 영향 파일
-- 수정: `config.py`, `query.py`, `tests/test_query.py`.
-- 문서: `implementation_plan.md`, `walkthrough.md`, `HANDOFF-sub.md`.
-- scratchpad(비커밋): eval 재측정 스크립트.
+## 구현 (`query.py`)
+- **`_ANSWER_PROMPT` 재구성:** [본문 조각] 먼저(1차 근거) → [그래프 힌트] 뒤(보조). 원칙 명시:
+  ① 본문에 실제 있는 것만 단정, 없으면 "정보 부족" ② 그래프 힌트는 요약일 뿐 원문 아님 — 본문과 충돌 시 본문 우선, 그래프-only·본문 무근거 내용은 단정 금지(빼거나 "그래프상" 표시) ③ 충실·포괄하되 지어내지 말 것.
+- **`_build_vector_context(chunks)` 신규:** 완전 중복 청크 제거 + `[본문 1]…[본문 N]` 번호 라벨. 비면 "(관련 본문을 찾지 못함)".
+- **`answer_question`:** 벡터 검색 1회 → 라벨/데둡본은 프롬프트용, 원문 청크(`\n`.join)는 그래프 매칭용 `extra_text`로 유지. 그래프 매칭 로직(브릿지)·top_k 설정값은 그대로.
 
 ## 검증
-- 기존 `test_query.py` 5개 하위호환(전부 `extra_text` 미지정 = 옛 동작).
-- 신규 테스트: ①본문 청크 엔티티가 그래프로 표면화 ②한 글자 이름 제외 ③`top_k=None`→설정값 호출.
-- `pytest` 전체 green 확인.
-- **eval 재측정(scratchpad, 비커밋):** `extra_text=""`·`top_k=8`(개선 전) vs 신 경로(개선 후)를 같은 컬렉션·같은 질문으로 `judge_pairwise` → 실제 리프트 수치화. 오늘 잔여 한도 내 소규모(6~8문항).
+- 기존 `test_query.py` 하위호환(프롬프트에 청크·엔티티 텍스트 여전히 포함). 신규: ①중복 청크 dedup ②프롬프트에 '본문 우선/보조' 프레이밍 포함.
+- `pytest` green.
+- **eval(scratchpad, 비커밋):** 환각이 관찰된 조건(캐럴 gemma-g1·flash-g1)에서 **구 프롬프트 vs 신 프롬프트** 답변을 같은 질문으로 비교 — ①Q6 등 환각(난로·물탱크) 소거 여부 직접 확인 ②페어와이즈 심판으로 충실성 리그레션 없음 확인. 여력 시 잠수함도.
 
 ## 롤백
-- `query.py`·`config.py` 되돌리면 끝(스키마·데이터 변경 없음).
+- `query.py`(_ANSWER_PROMPT·helper)만 되돌리면 끝.

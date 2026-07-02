@@ -2,6 +2,27 @@
 
 > AI 주도권 문서. 세션별 세부 변경 이력·현재 상태·미해결 문제·다음 단계를 기록한다.
 
+## 📅 2026-07-02 세션 — retrieval 투자 1차: 답변 합성 충실성 재구성
+
+### 배경
+- 4자 비교 실답변 진단: 추출 풍부 조건에서 **그래프발 환각**(flash-g1 '난로' 오귀속, gemma-g1 '물탱크'/'악귀 군단'). 근본 원인 = `_ANSWER_PROMPT`가 그래프·본문을 대등하게 제시.
+
+### 변경 (✅ 구현·pytest 완료 / ⏳ 전체 eval은 리셋 후)
+- **`query.py`:** `_ANSWER_PROMPT` 재구성 — **본문(벡터)=1차 근거, 그래프=보조 힌트**(충돌 시 본문 우선, 그래프-only·본문 무근거 주장 단정 금지), 본문 블록을 앞으로. `_build_vector_context`(완전중복 dedup + `[본문 N]` 라벨) 신규. `answer_question`은 라벨본=프롬프트용, 원문 청크=그래프 매칭용. **query.py만**(스키마·DAL·인터페이스 무변경).
+- **`tests/test_query.py` +3:** dedup·라벨 / 빈 입력 / 본문 우선 프레이밍. `pytest` **151 passed**.
+
+### 검증 (부분 — 한도 소진으로 중단)
+- 충실성 전/후 실측: `캐럴-flash-g1` **신 3승·구 2승·무 3**(리그레션 없음). 표적 환각은 확률적이라 이번 baseline 미재현 → 강한 실증 미완. `gemma-g1` 구간에서 한도 초과로 크래시.
+
+### ⚠️ 한도 정정 (중요)
+- **flash-lite 실제 하드 한도 = 500/일** — API 429가 `limit: 500, model: gemini-3.1-flash-lite, FreeTier`로 명시. 사용자 "넉넉해"는 gemma(1500)나 다른 지표였던 듯. **flash 대량 eval은 500 벽에 걸린다.** gemma는 별도 1500.
+- 측정 스크립트(`measure_faithfulness.py`)는 429에 크래시 → 리셋 후 재실행 전 try/except 견고화 필요.
+
+### ▶️ 다음 단계
+1. 커밋: `query.py tests/test_query.py implementation_plan.md walkthrough.md HANDOFF-sub.md` (사용자 승인).
+2. **태평양 자정 리셋 후:** gemma-g1 포함 전체 충실성 전/후 eval 완주 → 개선 확정/철회 판단.
+3. (이월) retrieval 투자 계속: 리랭킹·컨텍스트 구성 등.
+
 ## 📅 2026-07-01 세션 (2) — retrieval/답변 합성 개선 (top_k + 벡터→그래프 브릿지)
 
 ### 배경/목표

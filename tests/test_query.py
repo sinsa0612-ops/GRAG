@@ -137,3 +137,36 @@ def test_answer_question_uses_only_provided_context(monkeypatch):
     assert result == "답변"
     assert "강택리" in captured_prompts[0]
     assert "관련 본문 일부" in captured_prompts[0]
+
+
+def test_build_vector_context_dedups_and_labels():
+    # 완전 중복 조각은 제거되고, 남은 조각에 [본문 N] 번호가 순서대로 붙는다.
+    ctx = query._build_vector_context(["가나다", "가나다", "라마바"])
+
+    assert ctx.count("[본문 1]") == 1
+    assert "[본문 2]" in ctx
+    assert "[본문 3]" not in ctx  # 3개 입력이지만 중복 제거로 2개만 남음
+    assert "가나다" in ctx and "라마바" in ctx
+
+
+def test_build_vector_context_empty_placeholder():
+    assert "찾지 못함" in query._build_vector_context([])
+
+
+def test_answer_prompt_frames_vector_as_primary(monkeypatch):
+    # 본문(벡터)을 1차 근거, 그래프를 보조로 두는 프레이밍이 프롬프트에 담기고, 본문이 그래프보다 앞선다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    monkeypatch.setattr(
+        "query.vector_manager.query_similar",
+        lambda q, top_k=8, collections=None: ["조각내용"],
+    )
+    captured = []
+    monkeypatch.setattr(query, "generate", lambda prompt: captured.append(prompt) or "답")
+
+    query.answer_question("질문?")
+
+    prompt = captured[0]
+    assert "[본문 조각]" in prompt and "[그래프 힌트]" in prompt
+    assert "본문과 어긋나면" in prompt  # 충돌 시 본문 우선 원칙 명시
+    assert prompt.index("[본문 조각]") < prompt.index("[그래프 힌트]")  # 본문이 1차(먼저)
