@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 import time
+import uuid
 
 from config import settings
 from db import graph_manager, sqlite_manager, vector_manager
@@ -118,8 +119,14 @@ def needs_processing(collection: str, file_name: str, content_hash: str) -> bool
 
 # 새 source_id만 발급한다. 이 단계에서는 SQLite를 건드리지 않는다 — 처리가 끝까지
 # 성공해야 commit_document가 호출되므로, 중간에 실패하면 다음 시도에서 다시 처리 대상이 된다.
+# [버그수정 2026-07-19] 예전엔 밀리초 타임스탬프만 썼는데(f"doc_{int(time.time()*1000)}"), 같은 ms 안에
+# 두 번 호출되면 동일 id가 나와 documents 테이블(PK=source_id, REPLACE INTO)에서 뒤 문서가 앞 문서를
+# 덮어써 유실시켰다(원인 분석: _org/grag-review.md [HIGH] — 유희왕처럼 LLM 슬립 없이 빠르게 배치
+# ingest하면 상시 충돌). 타임스탬프는 디버깅용 시간 정보로 남기고, uuid4 8자리를 붙여 같은 ms 안에서도
+# 항상 유일하게 만든다(카운터+락 대신 uuid를 쓴 이유: 멀티프로세스/Streamlit 동시요청에도 안전하고
+# 프로세스 간 공유 상태가 필요 없다).
 def prepare_replacement(file_name: str) -> str:
-    return f"doc_{int(time.time() * 1000)}"
+    return f"doc_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
 
 
 # 모든 청킹/임베딩/추출이 성공적으로 끝난 뒤에만 호출한다.
