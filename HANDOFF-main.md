@@ -23,6 +23,10 @@
   - 검증된 발견(공정 4자 재적재 비교 flash/gemma×glean0/1, 벡터+그래프 정상 적재): 벡터 검색이 제대로 있으면 **추출 recall 2배 차이(gemma-g1 660 vs flash-g0 296 엔티티)도 Q&A 답변엔 거의 전환 안 됨** → 레버리지는 추출이 아니라 retrieval/합성. (M4의 'retrieval 병목' 방향성 확정. 단 M4 eval 수치는 벡터 미적재 캐럴 컬렉션 탓 무효였고 M5 공정 재적재로 재확인.) 서사(캐럴)·표/희소(잠수함) 문서 양쪽 답변 양호 → **retrieval은 견고한 상태로 종료.**
   - 부수: gemma 스레드풀 병렬 정상(프로브 6콜=5.1x; 느려 보임은 콜당 ~100초 채움구간 착시). flash-lite 하드 한도=500/일(API 명시).
 
+- **M6 (확정):** 정통 GraphRAG **커뮤니티+글로벌층** (브랜치 `feat/graphrag-full`, 트랙 내부 단계 M1~M4로 개발). ①**LLM 백엔드 라우터**(`generate(backend=)` — Ollama/Claude CLI/Codex CLI, Gemini는 기본 유지·미폐기) ②**엔티티 설명 통합요약**(다중 언급 설명을 로컬 qwen3로 1문단 통합, 옵트인 `summarize-descriptions`) ③**Leiden 계층 커뮤니티 탐지**(igraph+leidenalg, 컬렉션 격벽·고정 seed 결정성, **LLM 0회·무료**) ④**커뮤니티 요약 리포트**(레벨 라우팅: 하위=로컬 qwen3, 최상위=Claude CLI) ⑤**글로벌 map-reduce 검색**(`query --mode global`, 리포트 위 코퍼스 단위 sensemaking). 커밋 `5f841f6`·`7fb36a8`·`41cbdac`·`5305144`·`60cae1a`.
+- **M7 (확정):** **완전 무과금화 + 실전 E2E 검증** (2026-07-20 세션2). 단위테스트만 초록이던 M6를 실데이터로 처음 끝까지 돌려 2대 결함을 근본 수정: ①**로컬 추출 실사용화** — qwen3 추론(`<think>`) 미차단+타임아웃 120초로 추출이 100% 타임아웃나던 것을 `think:false`+타임아웃 300초로 해결(실측 ~250초/청크), `ingest --backend` 옵션·GUI 완성. ②**로컬 Q&A 무과금** — 핵심 `answer_question`이 Gemini 고정이라 키 없는 이 머신에서 막히던 것을 `answer_backend`(기본 ollama)로 해소(hot-path는 gemini일 때 바이트 불변). ③**글로벌 교차연결**(리프 리포트에 커뮤니티 간 엣지 포함) ④**M5 증분 재계산**(content_signature 기반 리포트 재사용, 순진한 멤버십-해시의 오재사용 방지). **E2E:** 실문서→추출→Leiden(커뮤니티6)→리포트→글로벌 종합→로컬 질의 전 구간 **로컬 ollama로 실동작 확인**(Gemini 키 없이). 커밋 `1ecbb0a`·`e4bf06c`·`78cd53a`·`db63323`. `pytest` **261 passed**.
+  - 확정 아키텍처 반영: 이 머신은 **완전 로컬(무과금) 기본** — 추출·설명통합·커뮤니티(무LLM)·리포트·글로벌·로컬 답변 모두 Ollama(qwen3:14b)/CLI로 동작. Gemini는 옵트인(키+RPD 필요)으로 남김. 추출은 ~250초/청크(느리지만 무제한).
+
 ## 다음 후보 (미확정 — 사용자 결정 대기)
 - 답변 모델 비교(`answer_question`에 `model` 인자) — retrieval이 견고한 지금, 더 강한 합성 모델이 답변을 개선하는지 측정(작은 변경).
 - 프롬프트 자동튠(컬렉션당 페르소나+few-shot, MS GraphRAG auto-tuning의 경량판). 단 M5 발견상 '추출↑→답변↑' 전환이 약해 ROI 재고 필요. 고정 엔티티 온톨로지는 유지.
