@@ -209,7 +209,8 @@ def test_cli_summarize_descriptions_dispatches_to_pipeline(tmp_path, monkeypatch
 
 
 def test_cli_communities_build_populates_sqlite(tmp_path, monkeypatch, capsys):
-    # LLM 없이(순수 CPU) 그래프를 직접 심고, communities build가 SQLite를 채우고 dirty를 해제하는지 확인한다.
+    # LLM 없이(순수 CPU) 그래프를 직접 심고, communities build --no-reports가 SQLite를 채우고 dirty를
+    # 해제하는지 확인한다(탐지 단계만 — 리포트 생성은 아래 별도 테스트에서 mock으로 검증).
     monkeypatch.setattr(settings, "project_root", tmp_path)
     from db import graph_manager, sqlite_manager
 
@@ -220,7 +221,7 @@ def test_cli_communities_build_populates_sqlite(tmp_path, monkeypatch, capsys):
     graph_manager.upsert_relation("사업A", "B", "C", "RELATED_TO", "", "doc1")
     assert sqlite_manager.is_communities_dirty("사업A") is True
 
-    graphrag_cli.main(["communities", "build", "--collection", "사업A"])
+    graphrag_cli.main(["communities", "build", "--collection", "사업A", "--no-reports"])
 
     stored = sqlite_manager.get_communities("사업A")
     assert stored
@@ -235,10 +236,93 @@ def test_cli_communities_build_on_empty_collection_stores_nothing(tmp_path, monk
 
     graphrag_cli.main(["init"])
 
-    graphrag_cli.main(["communities", "build", "--collection", "빈사업"])
+    graphrag_cli.main(["communities", "build", "--collection", "빈사업", "--no-reports"])
 
     assert sqlite_manager.get_communities("빈사업") == []
     assert "엔티티가 없어" in capsys.readouterr().out
+
+
+def test_cli_communities_build_requires_collection(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+
+    graphrag_cli.main(["init"])
+    graphrag_cli.main(["communities", "build"])
+
+    assert "--collection이 필요합니다" in capsys.readouterr().out
+
+
+def test_cli_communities_build_generates_reports_by_default(tmp_path, monkeypatch, capsys):
+    # [M3] --no-reports를 안 주면 탐지 후 community_reporter.generate_reports가 자동 호출돼야 한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import graph_manager
+    from pipeline import community_reporter
+
+    graphrag_cli.main(["init"])
+    graph_manager.upsert_entity("사업A", "A", "OTHER", "")
+    graph_manager.upsert_entity("사업A", "B", "OTHER", "")
+    graph_manager.upsert_relation("사업A", "A", "B", "RELATED_TO", "", "doc1")
+
+    captured = {}
+
+    def fake_generate_reports(collection, **kwargs):
+        captured["collection"] = collection
+        return 2
+
+    monkeypatch.setattr(community_reporter, "generate_reports", fake_generate_reports)
+
+    graphrag_cli.main(["communities", "build", "--collection", "사업A"])
+
+    assert captured["collection"] == "사업A"
+    assert "리포트 2개 생성 완료" in capsys.readouterr().out
+
+
+def test_cli_communities_build_no_reports_skips_report_generation(tmp_path, monkeypatch, capsys):
+    # [M3] --no-reports를 주면 community_reporter가 아예 호출되지 않아야 한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import graph_manager
+    from pipeline import community_reporter
+
+    graphrag_cli.main(["init"])
+    graph_manager.upsert_entity("사업A", "A", "OTHER", "")
+
+    calls = []
+    monkeypatch.setattr(
+        community_reporter, "generate_reports", lambda *a, **k: calls.append(1) or 0
+    )
+
+    graphrag_cli.main(["communities", "build", "--collection", "사업A", "--no-reports"])
+
+    assert calls == []
+    assert "리포트" not in capsys.readouterr().out
+
+
+def test_cli_communities_status_prints_counts_and_stale(tmp_path, monkeypatch, capsys):
+    # [M3] communities status가 컬렉션별 커뮤니티/리포트 개수와 stale 여부를 출력하는지 확인한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import sqlite_manager
+
+    graphrag_cli.main(["init"])
+    sqlite_manager.replace_communities(
+        "사업A",
+        [
+            {
+                "collection": "사업A", "community_id": "c1", "level": 0,
+                "parent_community_id": None, "entity_names": ["A"], "size": 1,
+                "graph_signature": "sig",
+            }
+        ],
+    )
+    sqlite_manager.upsert_community_report("사업A", "c1", 0, "제목", "요약", 5.0)
+    sqlite_manager.clear_communities_dirty("사업A", "sig")
+    sqlite_manager.mark_communities_dirty("사업A")
+
+    graphrag_cli.main(["communities", "status", "--collection", "사업A"])
+
+    out = capsys.readouterr().out
+    assert "사업A" in out
+    assert "커뮤니티 1개" in out
+    assert "리포트 1개" in out
+    assert "stale" in out
 
 
 # [M2 회귀] cmd_delete는 문서 삭제가 no-op이어도, cleanup이 기존 고립 엔티티를 지우면(=그래프 변이)

@@ -164,6 +164,23 @@ def init_schema() -> None:
             )
             """
         )
+        # 커뮤니티 리포트(M3) — 각 커뮤니티(레벨 0..n)에 LLM이 생성한 title/summary/rating을 저장한다.
+        # communities와 동일하게 코어 그래프를 건드리지 않는 텍스트 오버레이라, 컬렉션 삭제 시 함께
+        # 캐스케이드되고 재빌드 시 통째로 다시 만들 수 있다(M3는 증분 최적화 없이 매번 전체 재생성, M5 범위).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS community_reports (
+                collection TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                level INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                rating REAL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (collection, community_id)
+            )
+            """
+        )
 
 
 # 컬렉션+파일명으로 저장된 마지막 content_hash를 조회한다 (없으면 None).
@@ -535,3 +552,77 @@ def clear_communities_dirty(collection: str, graph_signature: str) -> None:
 def delete_community_build_state(collection: str) -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM community_build_state WHERE collection = ?", (collection,))
+
+
+# --- M3: 커뮤니티 리포트(community_reports) ---
+
+
+# 한 커뮤니티의 리포트를 새로 쓰거나 갱신한다(REPLACE — updated_at은 호출 시점으로 항상 갱신).
+def upsert_community_report(
+    collection: str, community_id: str, level: int, title: str, summary: str, rating: float | None
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            REPLACE INTO community_reports
+                (collection, community_id, level, title, summary, rating, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (collection, community_id, level, title, summary, rating),
+        )
+
+
+# 한 커뮤니티의 리포트를 조회한다(없으면 None).
+def get_community_report(collection: str, community_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT collection, community_id, level, title, summary, rating, updated_at "
+            "FROM community_reports WHERE collection = ? AND community_id = ?",
+            (collection, community_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "collection": row[0],
+        "community_id": row[1],
+        "level": row[2],
+        "title": row[3],
+        "summary": row[4],
+        "rating": row[5],
+        "updated_at": row[6],
+    }
+
+
+# 한 컬렉션의 커뮤니티 리포트를 조회한다(level을 주면 그 레벨만, 없으면 전체 레벨).
+def get_community_reports(collection: str, level: int | None = None) -> list[dict]:
+    with get_connection() as conn:
+        if level is None:
+            rows = conn.execute(
+                "SELECT collection, community_id, level, title, summary, rating, updated_at "
+                "FROM community_reports WHERE collection = ? ORDER BY level, community_id",
+                (collection,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT collection, community_id, level, title, summary, rating, updated_at "
+                "FROM community_reports WHERE collection = ? AND level = ? ORDER BY community_id",
+                (collection, level),
+            ).fetchall()
+    return [
+        {
+            "collection": r[0],
+            "community_id": r[1],
+            "level": r[2],
+            "title": r[3],
+            "summary": r[4],
+            "rating": r[5],
+            "updated_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+# 한 컬렉션의 커뮤니티 리포트를 전부 삭제한다(컬렉션 통째 삭제 시 호출 — 다른 오버레이 데이터와 동일한 캐스케이드 패턴).
+def delete_community_reports_by_collection(collection: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM community_reports WHERE collection = ?", (collection,))

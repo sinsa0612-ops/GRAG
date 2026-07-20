@@ -298,23 +298,59 @@ def cmd_summarize_descriptions(args) -> None:
     print(f"[{args.collection}] 설명 통합 완료: {updated}개 엔티티")
 
 
-# 커뮤니티 탐지(Leiden, 컬렉션별)를 실행해 SQLite에 저장한다(M2 — 탐지만, 요약 리포트는 M3).
-# 순수 CPU 연산이라 LLM 호출이 전혀 없다. 빌드가 끝까지 완주했을 때만 dirty를 해제한다(크래시 안전).
+# 컬렉션별 커뮤니티/리포트 현황(개수·재빌드 필요 여부)을 출력한다(communities status, M3).
+# collections가 None이면 문서/그래프 어느 쪽에든 존재가 확인된 모든 컬렉션을 대상으로 한다.
+def _print_communities_status(collections: list[str] | None) -> None:
+    from db import graph_manager, sqlite_manager
+
+    if collections is None:
+        collections = sorted(
+            set(sqlite_manager.get_collection_doc_counts()) | set(graph_manager.get_all_collections())
+        )
+    if not collections:
+        print("(아직 컬렉션이 없습니다)")
+        return
+    for collection in collections:
+        n_communities = len(sqlite_manager.get_communities(collection))
+        n_reports = len(sqlite_manager.get_community_reports(collection))
+        stale = " ⚠️ stale(재빌드 필요)" if sqlite_manager.is_communities_dirty(collection) else ""
+        print(f"- {collection}: 커뮤니티 {n_communities}개, 리포트 {n_reports}개{stale}")
+
+
+# 커뮤니티 탐지(Leiden, 컬렉션별) + 리포트 생성(M3)을 실행해 SQLite에 저장하거나, 현황을 출력한다.
+# build: 탐지(순수 CPU)는 항상 실행하고, 그 위에 기본으로 리포트(LLM 배치)까지 생성한다(--no-reports로
+# 건너뛸 수 있음). 탐지가 끝까지 완주했을 때만 dirty를 해제한다(크래시 안전 — 리포트 생성 단계의 개별
+# 실패는 community_reporter가 해당 커뮤니티만 건너뛰므로 dirty 해제 여부에 영향을 주지 않는다).
+# status: 컬렉션별 커뮤니티/리포트 개수와 stale 여부를 보여준다(--collection 생략 시 전체).
 def cmd_communities(args) -> None:
     from db import sqlite_manager
     from pipeline import community_detector
 
+    if args.action == "status":
+        _print_communities_status(_collections_from_args(args))
+        return
+
     if args.action == "build":
+        if not args.collection:
+            print("build는 --collection이 필요합니다.")
+            return
         collection = args.collection
         print(f"[{collection}] 커뮤니티 탐지 중(Leiden, 순수 CPU)...")
         communities, graph_signature = community_detector.detect_communities(collection)
         sqlite_manager.replace_communities(collection, communities)
         sqlite_manager.clear_communities_dirty(collection, graph_signature)
-        if communities:
-            levels = sorted({c["level"] for c in communities})
-            print(f"[{collection}] 커뮤니티 {len(communities)}개 저장 완료 (레벨 {levels})")
-        else:
+        if not communities:
             print(f"[{collection}] 엔티티가 없어 커뮤니티가 생성되지 않았습니다.")
+            return
+        levels = sorted({c["level"] for c in communities})
+        print(f"[{collection}] 커뮤니티 {len(communities)}개 저장 완료 (레벨 {levels})")
+
+        if not args.no_reports:
+            from pipeline import community_reporter
+
+            print(f"[{collection}] 커뮤니티 리포트 생성 중(bottom-up, 레벨별 백엔드 라우팅 — 시간이 걸릴 수 있습니다)...")
+            n_reports = community_reporter.generate_reports(collection)
+            print(f"[{collection}] 리포트 {n_reports}개 생성 완료")
 
 
 # "컬렉션:이름" 형식 인자를 (컬렉션, 이름)으로 가른다. 형식이 틀리면 None.
@@ -510,10 +546,15 @@ def main(argv: list[str] | None = None) -> None:
     p_summarize.set_defaults(func=cmd_summarize_descriptions)
 
     p_communities = sub.add_parser(
-        "communities", help="커뮤니티 탐지(Leiden, 컬렉션별) — 리포트/글로벌검색은 이후 마일스톤"
+        "communities", help="커뮤니티 탐지(Leiden) + 리포트 생성(M3) — 글로벌 검색은 이후 마일스톤"
     )
-    p_communities.add_argument("action", choices=["build"], help="동작(현재는 build만)")
-    p_communities.add_argument("--collection", required=True, help="대상 컬렉션(사업) 이름")
+    p_communities.add_argument("action", choices=["build", "status"], help="동작")
+    p_communities.add_argument(
+        "--collection", help="대상 컬렉션(사업) 이름 (build는 필수, status는 생략 시 전체·쉼표로 여러 개)"
+    )
+    p_communities.add_argument(
+        "--no-reports", action="store_true", help="build 시 리포트(LLM 배치) 생성을 건너뛰고 탐지만 수행"
+    )
     p_communities.set_defaults(func=cmd_communities)
 
     p_bridge = sub.add_parser("bridge", help="컬렉션 간 같은 대상 연결(SAME_AS 브릿지)")

@@ -234,6 +234,19 @@ def test_delete_collection_cascades_communities_and_build_state():
     assert sqlite_manager.is_communities_dirty("사업B") is False
 
 
+def test_delete_collection_cascades_community_reports():
+    # [M3] 컬렉션을 통째로 지우면 그 컬렉션의 커뮤니티 리포트도 함께 사라져야 한다(다른 컬렉션은 그대로).
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    sqlite_manager.upsert_community_report("사업A", "c1", 0, "A제목", "A요약", None)
+    sqlite_manager.upsert_community_report("사업B", "c1", 0, "B제목", "B요약", None)
+
+    document_store.delete_collection("사업A")
+
+    assert sqlite_manager.get_community_reports("사업A") == []
+    assert len(sqlite_manager.get_community_reports("사업B")) == 1
+
+
 def test_find_orphaned_source_ids_detects_untracked_data():
     sqlite_manager.init_schema()
     graph_manager.init_schema()

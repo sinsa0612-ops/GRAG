@@ -317,3 +317,68 @@ def test_delete_community_build_state_resets_to_dirty_by_default():
     sqlite_manager.delete_community_build_state(C)
 
     assert sqlite_manager.is_communities_dirty(C) is True
+
+
+# --- M3: community_reports(커뮤니티 리포트) ---
+
+
+def test_upsert_and_get_community_report_roundtrip():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_community_report(C, "c1", 0, "제목1", "요약1", 7.5)
+
+    report = sqlite_manager.get_community_report(C, "c1")
+
+    assert report["collection"] == C
+    assert report["community_id"] == "c1"
+    assert report["level"] == 0
+    assert report["title"] == "제목1"
+    assert report["summary"] == "요약1"
+    assert report["rating"] == 7.5
+    assert report["updated_at"]  # CURRENT_TIMESTAMP로 자동 채워짐
+
+
+def test_get_community_report_missing_returns_none():
+    sqlite_manager.init_schema()
+    assert sqlite_manager.get_community_report(C, "없음") is None
+
+
+def test_upsert_community_report_overwrites_existing():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_community_report(C, "c1", 0, "구제목", "구요약", 1.0)
+    sqlite_manager.upsert_community_report(C, "c1", 0, "신제목", "신요약", 9.0)
+
+    report = sqlite_manager.get_community_report(C, "c1")
+    assert report["title"] == "신제목"
+    assert report["summary"] == "신요약"
+    assert report["rating"] == 9.0
+
+
+def test_upsert_community_report_allows_null_rating():
+    # rating 파싱에 실패한 경우 None으로 저장될 수 있다(리포트 자체는 title/summary만으로도 유효).
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_community_report(C, "c1", 0, "제목", "요약", None)
+
+    assert sqlite_manager.get_community_report(C, "c1")["rating"] is None
+
+
+def test_get_community_reports_filters_by_level():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_community_report(C, "root", 0, "루트", "루트요약", None)
+    sqlite_manager.upsert_community_report(C, "child", 1, "자식", "자식요약", None)
+
+    level0 = sqlite_manager.get_community_reports(C, level=0)
+    level1 = sqlite_manager.get_community_reports(C, level=1)
+
+    assert [r["community_id"] for r in level0] == ["root"]
+    assert [r["community_id"] for r in level1] == ["child"]
+
+
+def test_community_reports_are_collection_scoped_and_cascade_delete():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_community_report("사업A", "c1", 0, "A제목", "A요약", None)
+    sqlite_manager.upsert_community_report("사업B", "c1", 0, "B제목", "B요약", None)
+
+    sqlite_manager.delete_community_reports_by_collection("사업A")
+
+    assert sqlite_manager.get_community_reports("사업A") == []
+    assert len(sqlite_manager.get_community_reports("사업B")) == 1

@@ -171,6 +171,7 @@ def delete_collection(collection: str) -> int:
     sqlite_manager.delete_desc_candidates_by_collection(collection)  # [M1.5] 유령 설명 후보 방지
     sqlite_manager.delete_communities_by_collection(collection)  # [M2] 커뮤니티 오버레이도 함께 삭제
     sqlite_manager.delete_community_build_state(collection)  # [M2] dirty/서명 상태도 함께 삭제
+    sqlite_manager.delete_community_reports_by_collection(collection)  # [M3] 커뮤니티 리포트도 함께 삭제
     logger.info("컬렉션 통째 삭제: %s (문서 %d개)", collection, doc_count)
     return doc_count
 

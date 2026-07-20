@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     # 계층 재귀가 내려갈 수 있는 최대 레벨(0=최상위). 무한 재귀를 막는 안전판이기도 하다.
     community_max_level: int = 3
 
+    # --- 커뮤니티 리포트(M3, LLM 배치) 설정 — spec-addendum §A 라우팅 정책 ---
+    # 대량 배치(하위/중간 레벨) 리포트 생성 기본 백엔드. 무료·무제한이라 수백 콜도 부담 없다.
+    # Gemini는 폐기하지 않고(CEO 지시) 이 값을 "gemini"로 바꿔 선택할 수 있게 열어둔다.
+    community_report_bulk_backend: str = "ollama"
+    # 최상위 레벨(소수·고가치) 리포트 생성 기본 백엔드. 재빌드당 몇십 콜 수준이라 쿼터 부담이 적다.
+    community_report_top_backend: str = "claude_cli"
+    # 레벨 0(최상위)부터 이 개수만큼의 레벨을 top 백엔드로, 나머지(대량)는 bulk 백엔드로 라우팅한다.
+    report_cli_top_levels: int = 1
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:
