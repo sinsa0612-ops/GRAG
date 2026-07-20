@@ -104,10 +104,16 @@ def _build_vector_context(chunks: list[str]) -> str:
 # collections=None이면 전체 컬렉션을 종합(행정 종합), 지정하면 그 사업(들) 범위 안에서만 답한다.
 # top_k를 주지 않으면 설정값(settings.retrieval_top_k)을 쓴다.
 def answer_question(
-    question: str, collections: list[str] | None = None, top_k: int | None = None
+    question: str,
+    collections: list[str] | None = None,
+    top_k: int | None = None,
+    backend: str | None = None,
 ) -> str:
     if top_k is None:
         top_k = settings.retrieval_top_k
+    # 답변 합성 백엔드: 지정 없으면 설정값(기본 ollama = 무과금). "gemini"로 해석되면 아래 record/generate가
+    # 기존 hot-path와 100% 동일하게 동작한다(오케스트레이션만 추가, 프롬프트·검색 로직 불변).
+    backend = backend or settings.answer_backend
     # 벡터 검색을 먼저 1회 수행해, 찾은 본문 조각을 (a)근거 컨텍스트와 (b)그래프 매칭용 힌트로 함께 쓴다.
     chunks = vector_manager.query_similar(question, top_k=top_k, collections=collections)
     vector_context = _build_vector_context(chunks)
@@ -117,9 +123,10 @@ def answer_question(
         graph_context=graph_context, vector_context=vector_context, question=question
     )
     logger.info("그래프 컨텍스트:\n%s", graph_context)
-    # 질문 1건당 LLM 호출 1번이 나가므로 오늘 사용량에 기록한다(RPD 추적).
-    sqlite_manager.record_api_usage(1)
-    return generate(prompt)
+    # Gemini만 RPD 한도에 잡히므로 그때만 사용량을 기록한다(ollama/CLI는 로컬·구독이라 무관).
+    if backend in (None, "gemini"):
+        sqlite_manager.record_api_usage(1)
+    return generate(prompt, backend=backend)
 
 
 # ══════════════════════ M4: 글로벌(map-reduce) 검색 ══════════════════════

@@ -305,25 +305,32 @@ def render_ingest_tab() -> None:
 
 # 추출된 그래프+벡터 정보만 근거로 질문에 답하는 탭(graphrag query). 범위는 전체 또는 특정 컬렉션.
 def render_query_tab() -> None:
-    if not settings.gemini_api_key:
-        st.warning("`.env`에 GEMINI_API_KEY가 없습니다 — 답변 생성이 실패할 수 있습니다.")
-
     scope = _pick_scope("query")
     st.caption(f"범위: {_scope_label(scope)} · 그래프에 등록된 이름을 그대로 쓰면 정확도가 올라갑니다.")
     mode = st.radio(
         "검색 방식", ["로컬 (기본)", "글로벌 (주제·종합)"], horizontal=True, key="query_mode"
     )
+    # 답변 합성 백엔드 — 기본 Ollama(무과금). 백엔드는 ingest 탭과 동일 집합을 재사용한다.
+    _labels = list(_INGEST_BACKENDS)
+    _default_idx = list(_INGEST_BACKENDS.values()).index("ollama")
+    backend_label = st.selectbox(
+        "답변 백엔드", _labels, index=_default_idx, key="query_backend",
+        help="로컬 검색 답변을 어느 모델로 합성할지. 기본 Ollama=무과금. Gemini는 키·RPD 한도 필요.",
+    )
+    backend = _INGEST_BACKENDS[backend_label]
+    if backend in (None, "gemini") and not settings.gemini_api_key:
+        st.warning("`.env`에 GEMINI_API_KEY가 없습니다 — Gemini 답변은 실패합니다. 'Ollama'를 고르면 무과금으로 답합니다.")
     question = st.text_area("질문", placeholder="예: 김부장은 무슨 일을 해?", key="query_q")
 
     if st.button("질문하기", disabled=not question.strip(), key="query_run"):
         with st.spinner("답변 생성 중..."):
             try:
                 if mode.startswith("글로벌"):
-                    answer = _answer_global_with_fallback(question.strip(), scope)
+                    answer = _answer_global_with_fallback(question.strip(), scope, backend)
                 else:
                     from query import answer_question
 
-                    answer = answer_question(question.strip(), collections=scope)
+                    answer = answer_question(question.strip(), collections=scope, backend=backend)
                 st.markdown("### 답변")
                 st.write(answer)
             except Exception as exc:
@@ -333,7 +340,9 @@ def render_query_tab() -> None:
 # [M4] 글로벌(map-reduce) 질의를 실행한다. 스코프 중 커뮤니티가 stale(재빌드 필요 — 미빌드 포함,
 # is_communities_dirty가 둘 다 판정)인 컬렉션이 있으면 CLI(--mode global)와 같은 논리로 재빌드 안내를
 # 띄운 뒤 로컬 검색 답변으로 즉시 폴백한다.
-def _answer_global_with_fallback(question: str, scope: list[str] | None) -> str:
+def _answer_global_with_fallback(
+    question: str, scope: list[str] | None, backend: str | None = None
+) -> str:
     from query import answer_question, answer_question_global
 
     target = scope if scope is not None else _list_collections()
@@ -343,7 +352,7 @@ def _answer_global_with_fallback(question: str, scope: list[str] | None) -> str:
             f"커뮤니티가 없거나 오래됨(재빌드 필요): {', '.join(stale)} "
             f"— 먼저 `graphrag communities build --collection <이름>`을 실행하세요. 우선 로컬 검색으로 답합니다."
         )
-        return answer_question(question, collections=scope)
+        return answer_question(question, collections=scope, backend=backend)
     return answer_question_global(question, collections=scope, level=None)
 
 

@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # 글로벌 검색 기본 레벨(레벨 0 = 최상위, community_max_level 주석과 동일 규칙). --level로 질의별 오버라이드 가능.
     global_search_default_level: int = 0
 
+    # --- 로컬 질의(answer_question) 답변 합성 백엔드 ---
+    # 완전 로컬(무과금) 운영이 이 프로젝트의 기본이라 ollama로 둔다. Gemini 키가 있고 flash-lite 합성을
+    # 원하면 .env에서 ANSWER_BACKEND=gemini로 되돌린다(그때만 RPD 한도에 잡힌다). query --backend로 질의별 오버라이드 가능.
+    answer_backend: str = "ollama"
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:

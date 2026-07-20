@@ -263,7 +263,7 @@ def test_cli_query_mode_defaults_to_local_and_behaves_unchanged(monkeypatch, cap
     sqlite_manager.init_schema()
     graph_manager.init_schema()
     monkeypatch.setattr("query.vector_manager.query_similar", lambda q, top_k=8, collections=None: [])
-    monkeypatch.setattr(query, "generate", lambda prompt: "로컬답변")
+    monkeypatch.setattr(query, "generate", lambda prompt, **kwargs: "로컬답변")
 
     graphrag_cli.main(["query", "아무 질문"])
 
@@ -321,7 +321,7 @@ def test_cli_query_mode_global_falls_back_to_local_when_stale(monkeypatch, capsy
     sqlite_manager.init_schema()
     graph_manager.init_schema()
     monkeypatch.setattr("query.vector_manager.query_similar", lambda q, top_k=8, collections=None: [])
-    monkeypatch.setattr(query, "generate", lambda prompt: "로컬 폴백 답변")
+    monkeypatch.setattr(query, "generate", lambda prompt, **kwargs: "로컬 폴백 답변")
 
     graphrag_cli.main(["query", "아무 질문", "--mode", "global", "--collection", C1])
 

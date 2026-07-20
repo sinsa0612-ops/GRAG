@@ -248,7 +248,10 @@ def cmd_query(args) -> None:
 
     from query import answer_question
 
-    print(answer_question(args.question, collections=_collections_from_args(args)))
+    print(answer_question(
+        args.question, collections=_collections_from_args(args),
+        backend=getattr(args, "backend", None),
+    ))
 
 
 # 그래프를 Gephi용 GEXF로 내보낸다. -o 로 경로를 지정하면 그곳에, 아니면 exports/에 저장한다.
@@ -560,6 +563,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_query.add_argument(
         "--level", type=int, help="글로벌 검색 전용: 조회할 커뮤니티 레벨(0=최상위, 미지정 시 설정 기본값)",
+    )
+    p_query.add_argument(
+        "--backend", choices=["gemini", "ollama", "claude_cli", "codex_cli"], default=None,
+        help="로컬 검색 답변 합성 백엔드(미지정 시 설정 기본=ollama 무과금). gemini는 키·RPD 한도 필요.",
     )
     p_query.set_defaults(func=cmd_query)
 
