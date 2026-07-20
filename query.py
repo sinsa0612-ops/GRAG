@@ -1,5 +1,8 @@
 # 그래프(엔티티/관계) + 벡터 검색 결과만 근거로 질문에 답하는 하이브리드 질의 모듈.
 # LLM의 사전 지식이 아니라, 파이프라인이 실제로 추출/저장한 정보만 사용하는지 검증하는 용도.
+# [M4] 파일 하단에 커뮤니티 리포트(M3) 위에서 map-reduce로 답하는 글로벌 검색(answer_question_global)을
+# 추가했다 — 아래 로컬 검색(answer_question, _ANSWER_PROMPT)은 hot-path 불변 대상이라 한 글자도 손대지 않았다.
+import json
 import logging
 
 from adapters.llm_adapter import generate
@@ -117,3 +120,135 @@ def answer_question(
     # 질문 1건당 LLM 호출 1번이 나가므로 오늘 사용량에 기록한다(RPD 추적).
     sqlite_manager.record_api_usage(1)
     return generate(prompt)
+
+
+# ══════════════════════ M4: 글로벌(map-reduce) 검색 ══════════════════════
+# 커뮤니티 리포트(M3가 생성해 SQLite에 저장한 것) 위에서 map-reduce로 코퍼스 단위 sensemaking 질문
+# ("이 자료 전체의 주제는?" 류)에 답한다. 로컬 검색(answer_question)과 달리 원문 조각이 아니라 이미
+# 요약된 리포트를 재료로 쓰므로, 개별 사실보다 "전체를 종합한 그림"에 강하다.
+# 도메인·언어 중립 프롬프트(spec-addendum §B) — community_reporter.py의 프롬프트와 동일한 톤으로,
+# 업종 어휘를 가정하지 않고 입력(리포트/부분답변)에 쓰인 언어를 그대로 따라가도록 유도한다.
+
+_MAP_PROMPT = """\
+아래는 어떤 자료 묶음(커뮤니티)을 요약한 리포트다. 이 리포트가 다음 질문에 답하는 데 도움이 되는지 판단해줘.
+리포트에 쓰인 언어를 그대로 사용해서 답해.
+
+리포트 제목: {title}
+리포트 요약: {summary}
+
+질문: {question}
+
+다음 JSON 형식으로만 응답해줘(다른 설명이나 머리말 없이 순수 JSON만):
+{{"relevance": 이 리포트가 질문에 얼마나 도움되는지 나타내는 0에서 10 사이 정수(전혀 관련 없으면 0), "partial_answer": "이 리포트만 근거로 한 부분 답변(관련 없으면 빈 문자열)"}}
+"""
+
+_REDUCE_PROMPT = """\
+아래는 하나의 질문에 대해 서로 다른 자료 묶음(커뮤니티)에서 나온 부분 답변들이다(관련도 높은 순으로 나열).
+이 부분 답변들을 종합해 질문에 대한 하나의 완결된 답변을 작성해줘. 부분 답변에 쓰인 언어를 그대로 사용해서 답해.
+
+질문: {question}
+
+부분 답변들(관련도 높은 순):
+{partial_answers}
+
+위 부분 답변들을 종합한 최종 답변만 작성해줘(다른 설명이나 머리말 없이 답변 본문만).
+"""
+
+# 스코프에 리포트가 아예 없을 때(커뮤니티가 한 번도 안 빌드됨) 돌려주는 안내 문자열 — CLI/GUI가 별도
+# 안내 로직 없이 이 반환값을 그대로 보여주면 되도록, 빌드 명령까지 여기서 알려준다.
+_NO_REPORTS_MESSAGE = (
+    "이 범위에는 아직 커뮤니티 리포트가 없습니다. "
+    "먼저 `graphrag communities build --collection <이름>`을 실행하세요."
+)
+# 리포트는 있지만(빌드는 됨) MAP 결과가 전부 관련도 0(또는 파싱 실패)이라 종합할 부분답변이 없을 때.
+_NO_RELEVANT_MESSAGE = "이 범위의 커뮤니티 리포트 중 질문과 관련된 내용을 찾지 못했습니다."
+
+
+# collections가 None이면(--all) 문서·그래프 어느 쪽에든 존재가 확인된 모든 컬렉션을 대상으로 한다
+# (graphrag_cli._print_communities_status와 동일 관례). 명시되면 그 목록을 그대로 쓴다.
+def _resolve_global_collections(collections: list[str] | None) -> list[str]:
+    if collections is not None:
+        return collections
+    return sorted(
+        set(sqlite_manager.get_collection_doc_counts()) | set(graph_manager.get_all_collections())
+    )
+
+
+# 스코프 내 커뮤니티 리포트를 모은다. 컬렉션마다 따로 조회해 리스트를 이어붙일 뿐이므로(union),
+# 서로 다른 컬렉션의 멤버가 하나의 커뮤니티로 섞이는 일은 없다 — 격벽은 이미 탐지 단계
+# (community_detector, M2)에서 컬렉션별로 지켜졌고, 여기서는 그 결과물(리포트)을 나열만 한다.
+def _collect_global_reports(collections: list[str], level: int) -> list[dict]:
+    reports: list[dict] = []
+    for collection in collections:
+        reports.extend(sqlite_manager.get_community_reports(collection, level=level))
+    return reports
+
+
+# MAP 단계 LLM 원시 응답에서 relevance/partial_answer를 방어적으로 파싱한다
+# (community_reporter._parse_report와 동형 — 코드펜스 제거 후 json.loads). relevance는 정수로
+# 강제하고 음수는 0으로 clamp한다(파싱 실패는 예외로 알려 호출부가 그 리포트만 건너뛰게 한다).
+def _parse_map_response(raw_text: str) -> dict:
+    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+    data = json.loads(cleaned)
+    relevance = max(0, int(data.get("relevance") or 0))
+    partial_answer = str(data.get("partial_answer") or "").strip()
+    return {"relevance": relevance, "partial_answer": partial_answer}
+
+
+# MAP: 리포트 하나마다 "질문에 도움되는가?" LLM 질의를 던져 관련도 점수+부분답변을 얻는다.
+# 개별 리포트 실패(LLM 오류/파싱 실패)는 그 리포트만 건너뛰고 계속한다(community_reporter와 동형의 장애
+# 격리). 관련도 0(또는 파싱 실패로 취급)인 리포트는 버린다. backend가 "gemini"로 해석될 때만(config로
+# 옵트인 시) 호출마다 RPD 사용량을 기록한다 — Ollama는 무료라 기본 설정에서는 기록되지 않는다.
+def _map_reports(reports: list[dict], question: str) -> list[dict]:
+    backend = settings.global_search_map_backend
+    scored: list[dict] = []
+    for report in reports:
+        prompt = _MAP_PROMPT.format(title=report["title"], summary=report["summary"], question=question)
+        try:
+            raw = generate(prompt, backend=backend)
+            if backend in (None, "gemini"):
+                sqlite_manager.record_api_usage(1)
+            parsed = _parse_map_response(raw)
+        except Exception as exc:
+            logger.warning(
+                "[%s] 커뮤니티 %s: 글로벌 MAP 실패, 건너뜀: %s",
+                report["collection"], report["community_id"], exc,
+            )
+            continue
+        if parsed["relevance"] <= 0 or not parsed["partial_answer"]:
+            continue
+        scored.append(parsed)
+    return scored
+
+
+# REDUCE: 관련도 상위 부분답변들을 하나의 최종 답변으로 종합한다(LLM 1콜). 호출부(answer_question_global)가
+# scored가 비어 있지 않음을 이미 보장하므로 여기서는 항상 최소 1건 이상을 받는다. backend가 "gemini"로
+# 해석될 때만 RPD 사용량을 기록한다(MAP과 동일 원칙).
+def _reduce_answers(scored: list[dict], question: str) -> str:
+    scored.sort(key=lambda s: -s["relevance"])
+    partial_answers = "\n\n".join(f"- (관련도 {s['relevance']}) {s['partial_answer']}" for s in scored)
+    prompt = _REDUCE_PROMPT.format(question=question, partial_answers=partial_answers)
+    backend = settings.global_search_reduce_backend
+    answer = generate(prompt, backend=backend)
+    if backend in (None, "gemini"):
+        sqlite_manager.record_api_usage(1)
+    return answer
+
+
+# 커뮤니티 리포트(M3) 위에서 map-reduce로 코퍼스 단위 sensemaking 질문에 답한다.
+# collections=None이면 존재하는 모든 컬렉션의 리포트를 모아 종합한다(--all, 컬렉션별 union — 격벽 유지,
+# 위 _collect_global_reports 참고). level=None이면 설정 기본 레벨(레벨 0=최상위)을 쓴다.
+# 리포트가 비어 있으면(미빌드) 빌드 안내를, MAP 결과가 전부 무관하면 "못 찾음" 안내를 반환한다 —
+# CLI/GUI는 이 반환값을 그대로 보여주기만 하면 되므로 호출부에 별도 안내 로직이 필요 없다.
+def answer_question_global(
+    question: str, collections: list[str] | None = None, level: int | None = None
+) -> str:
+    target_collections = _resolve_global_collections(collections)
+    level_to_use = settings.global_search_default_level if level is None else level
+    reports = _collect_global_reports(target_collections, level_to_use)
+    if not reports:
+        return _NO_REPORTS_MESSAGE
+    scored = _map_reports(reports, question)
+    if not scored:
+        return _NO_RELEVANT_MESSAGE
+    return _reduce_answers(scored, question)

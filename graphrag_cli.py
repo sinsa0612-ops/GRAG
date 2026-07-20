@@ -209,8 +209,38 @@ def cmd_delete_collection(args) -> None:
     print(f"컬렉션 '{args.collection}' 삭제 완료 (문서 {count}개 + 엔티티/관계/청크)")
 
 
-# 추출된 그래프+벡터 정보만 근거로 질문에 답한다.
+# [M4] 글로벌(map-reduce) 질의를 실행한다. 스코프 컬렉션 중 하나라도 커뮤니티가 stale(재빌드 필요 —
+# 한 번도 안 빌드됐거나 마지막 빌드 이후 그래프가 바뀐 경우 모두 포함, is_communities_dirty가 두 경우를
+# 함께 판정한다)이면 재빌드 안내를 먼저 보여준 뒤, 사용자가 질문에 대한 답 없이 끝나지 않도록 로컬
+# 검색으로 즉시 폴백한다([ASSUMPTION] 안내만 하고 종료하는 대신 자동 로컬 폴백을 택함 — m4-result.md 근거).
+def _cmd_query_global(args) -> None:
+    from db import graph_manager, sqlite_manager
+    from query import answer_question, answer_question_global
+
+    collections = _collections_from_args(args)
+    target = collections if collections is not None else sorted(
+        set(sqlite_manager.get_collection_doc_counts()) | set(graph_manager.get_all_collections())
+    )
+    stale = [c for c in target if sqlite_manager.is_communities_dirty(c)]
+    if stale:
+        print(
+            f"⚠️ 커뮤니티가 없거나 오래됨(재빌드 필요): {', '.join(stale)} "
+            f"— 먼저 `graphrag communities build --collection <이름>`을 실행하세요."
+        )
+        print("(우선 로컬 검색으로 답합니다)")
+        print(answer_question(args.question, collections=collections))
+        return
+    print(answer_question_global(args.question, collections=collections, level=args.level))
+
+
+# 추출된 그래프+벡터 정보만 근거로 질문에 답한다. --mode global이면 커뮤니티 리포트(M3) 위에서
+# map-reduce로 종합 답변한다(M4, _cmd_query_global). 기본(local)은 기존과 완전히 동일한 코드 경로다
+# (hot-path 불변 — mode 분기가 없던 시절과 바이트 동일하게 answer_question을 호출한다).
 def cmd_query(args) -> None:
+    if getattr(args, "mode", "local") == "global":
+        _cmd_query_global(args)
+        return
+
     from query import answer_question
 
     print(answer_question(args.question, collections=_collections_from_args(args)))
@@ -515,6 +545,13 @@ def main(argv: list[str] | None = None) -> None:
     p_query.add_argument("question", help="질문 내용")
     p_query.add_argument("--collection", help="범위 컬렉션(쉼표로 여러 개)")
     p_query.add_argument("--all", action="store_true", help="전체 컬렉션 종합(행정 종합)")
+    p_query.add_argument(
+        "--mode", choices=["local", "global"], default="local",
+        help="local(기본)=그래프+벡터 직접 검색, global=커뮤니티 리포트 위 map-reduce 종합 검색(M4, communities build 선행 필요)",
+    )
+    p_query.add_argument(
+        "--level", type=int, help="글로벌 검색 전용: 조회할 커뮤니티 레벨(0=최상위, 미지정 시 설정 기본값)",
+    )
     p_query.set_defaults(func=cmd_query)
 
     p_graph = sub.add_parser("graph", help="Gephi용 GEXF 내보내기")

@@ -280,18 +280,41 @@ def render_query_tab() -> None:
 
     scope = _pick_scope("query")
     st.caption(f"범위: {_scope_label(scope)} · 그래프에 등록된 이름을 그대로 쓰면 정확도가 올라갑니다.")
+    mode = st.radio(
+        "검색 방식", ["로컬 (기본)", "글로벌 (주제·종합)"], horizontal=True, key="query_mode"
+    )
     question = st.text_area("질문", placeholder="예: 김부장은 무슨 일을 해?", key="query_q")
 
     if st.button("질문하기", disabled=not question.strip(), key="query_run"):
-        from query import answer_question
-
         with st.spinner("답변 생성 중..."):
             try:
-                answer = answer_question(question.strip(), collections=scope)
+                if mode.startswith("글로벌"):
+                    answer = _answer_global_with_fallback(question.strip(), scope)
+                else:
+                    from query import answer_question
+
+                    answer = answer_question(question.strip(), collections=scope)
                 st.markdown("### 답변")
                 st.write(answer)
             except Exception as exc:
                 st.error(f"질문 처리 실패: {exc}")
+
+
+# [M4] 글로벌(map-reduce) 질의를 실행한다. 스코프 중 커뮤니티가 stale(재빌드 필요 — 미빌드 포함,
+# is_communities_dirty가 둘 다 판정)인 컬렉션이 있으면 CLI(--mode global)와 같은 논리로 재빌드 안내를
+# 띄운 뒤 로컬 검색 답변으로 즉시 폴백한다.
+def _answer_global_with_fallback(question: str, scope: list[str] | None) -> str:
+    from query import answer_question, answer_question_global
+
+    target = scope if scope is not None else _list_collections()
+    stale = [c for c in target if sqlite_manager.is_communities_dirty(c)]
+    if stale:
+        st.warning(
+            f"커뮤니티가 없거나 오래됨(재빌드 필요): {', '.join(stale)} "
+            f"— 먼저 `graphrag communities build --collection <이름>`을 실행하세요. 우선 로컬 검색으로 답합니다."
+        )
+        return answer_question(question, collections=scope)
+    return answer_question_global(question, collections=scope, level=None)
 
 
 # ───────────────────────── 🕸️ 그래프 탭 ─────────────────────────

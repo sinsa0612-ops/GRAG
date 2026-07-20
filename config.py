@@ -87,6 +87,15 @@ class Settings(BaseSettings):
     # 레벨 0(최상위)부터 이 개수만큼의 레벨을 top 백엔드로, 나머지(대량)는 bulk 백엔드로 라우팅한다.
     report_cli_top_levels: int = 1
 
+    # --- 글로벌(map-reduce) 검색(M4, 옵트인 질의) 설정 — spec-addendum §A 라우팅 정책 ---
+    # MAP 단계(스코프 내 리포트마다 1콜, 대량) 기본 백엔드. 무료·무제한이라 리포트 수가 많아도 부담 없다.
+    # Gemini는 폐기하지 않고(CEO 지시) 이 값을 "gemini"로 바꿔 선택할 수 있게 열어둔다.
+    global_search_map_backend: str = "ollama"
+    # REDUCE 단계(질의당 1콜, 소수) 기본 백엔드. config로 "claude_cli"를 옵트인하면 고품질 단발 종합이 가능하다.
+    global_search_reduce_backend: str = "ollama"
+    # 글로벌 검색 기본 레벨(레벨 0 = 최상위, community_max_level 주석과 동일 규칙). --level로 질의별 오버라이드 가능.
+    global_search_default_level: int = 0
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:
