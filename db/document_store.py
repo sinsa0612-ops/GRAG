@@ -141,6 +141,7 @@ def commit_document(
         logger.info("기존 문서 데이터 삭제: [%s] %s (source_id=%s)", collection, file_name, old_source_id)
         vector_manager.delete_chunks_by_source(old_source_id)
         graph_manager.delete_relations_by_source_doc(old_source_id)
+        sqlite_manager.delete_desc_candidates_by_source_doc(old_source_id)  # [M1.5] 유령 설명 후보 방지
 
 
 # 문서를 완전히 삭제한다(SQLite 기록 + 벡터 청크 + 관계). 엔티티 노드 자체는 남는다
@@ -153,7 +154,9 @@ def delete_document(collection: str, file_name: str) -> bool:
 
     vector_manager.delete_chunks_by_source(source_id)
     graph_manager.delete_relations_by_source_doc(source_id)
+    sqlite_manager.delete_desc_candidates_by_source_doc(source_id)  # [M1.5] 유령 설명 후보 방지
     sqlite_manager.delete_document(collection, file_name)
+    sqlite_manager.mark_communities_dirty(collection)  # [M2] 관계가 사라졌으니 커뮤니티 재빌드 필요
     logger.info("문서 완전 삭제: [%s] %s (source_id=%s)", collection, file_name, source_id)
     return True
 
@@ -165,6 +168,10 @@ def delete_collection(collection: str) -> int:
     vector_manager.delete_chunks_by_collection(collection)
     graph_manager.delete_collection(collection)
     sqlite_manager.delete_collection_documents(collection)
+    sqlite_manager.delete_desc_candidates_by_collection(collection)  # [M1.5] 유령 설명 후보 방지
+    sqlite_manager.delete_communities_by_collection(collection)  # [M2] 커뮤니티 오버레이도 함께 삭제
+    sqlite_manager.delete_community_build_state(collection)  # [M2] dirty/서명 상태도 함께 삭제
+    sqlite_manager.delete_community_reports_by_collection(collection)  # [M3] 커뮤니티 리포트도 함께 삭제
     logger.info("컬렉션 통째 삭제: %s (문서 %d개)", collection, doc_count)
     return doc_count
 
@@ -182,5 +189,6 @@ def cleanup_orphaned_data() -> int:
     for source_id in orphaned:
         vector_manager.delete_chunks_by_source(source_id)
         graph_manager.delete_relations_by_source_doc(source_id)
+        sqlite_manager.delete_desc_candidates_by_source_doc(source_id)  # [M1.5] 유령 설명 후보 방지
         logger.info("고아 데이터 정리: source_id=%s", source_id)
     return len(orphaned)

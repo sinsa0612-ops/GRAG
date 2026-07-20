@@ -52,6 +52,59 @@ class Settings(BaseSettings):
     # 백업(backups/)을 최신 몇 개까지 보관할지. 새 백업을 만들 때마다 이 개수를 넘는 오래된 백업은 자동 삭제한다.
     backup_keep: int = 10
 
+    # --- 신규 LLM 백엔드(옵트인) 설정 — 기본 Gemini 경로에는 영향 없음 ---
+    # Ollama(로컬 LLM) HTTP 엔드포인트. 로컬 기본 포트가 11434.
+    ollama_base_url: str = "http://localhost:11434"
+    # 로컬 LLM 백엔드 기본 모델(이미 로컬에 받아둔 모델, 재다운로드 없음).
+    ollama_model_name: str = "qwen3:14b"
+    # Ollama 요청 타임아웃(초). 로컬 추출 1콜(1900자 청크 → 구조화 엔티티/관계 JSON)이 qwen3:14b에서
+    # 실측 ~250초 걸린다(요약 콜은 수십 초). Gemini 폴백이 없는 완전 로컬 구성이라 추출이 유일 경로이므로,
+    # 추출 1콜이 완주할 수 있게 여유를 둔다(120초로는 추출이 전부 타임아웃났다 — 실전 검증에서 확인).
+    ollama_request_timeout_sec: float = 300.0
+    # Claude/Codex CLI 바이너리 경로. 기본은 이름만 두어 PATH에서 찾게 하고(대화형 셸 함수가 아니라
+    # 실바이너리가 필요), 비로그인 subprocess가 PATH로 못 찾으면 .env에서 절대경로로 오버라이드한다.
+    claude_cli_path: str = "claude"
+    codex_cli_path: str = "codex"
+    # CLI 백엔드 subprocess 타임아웃(초). 에이전트형 CLI라 단순 API 콜보다 오래 걸릴 수 있다.
+    cli_llm_timeout_sec: float = 300.0
+
+    # --- 설명 요약(M1.5, 옵트인 배치) 설정 ---
+    # 엔티티 설명 후보가 이 개수 이상 쌓여야 통합 요약을 트리거한다(후보 1개는 통합할 게 없어 스킵, 호출 절약).
+    desc_summary_min_candidates: int = 2
+
+    # --- 커뮤니티 탐지(M2, igraph+leidenalg) 설정 — 순수 CPU, LLM 호출 없음 ---
+    # Leiden 알고리즘 난수 시드. 고정해야 같은 그래프에서 재탐지해도 같은 커뮤니티가 나온다(테스트 재현성).
+    leiden_seed: int = 42
+    # 커뮤니티 크기가 이 값을 넘으면 그 유도 서브그래프에 Leiden을 한 번 더 돌려 하위 레벨로 쪼갠다.
+    community_max_size: int = 30
+    # 계층 재귀가 내려갈 수 있는 최대 레벨(0=최상위). 무한 재귀를 막는 안전판이기도 하다.
+    community_max_level: int = 3
+
+    # --- 커뮤니티 리포트(M3, LLM 배치) 설정 — spec-addendum §A 라우팅 정책 ---
+    # 대량 배치(하위/중간 레벨) 리포트 생성 기본 백엔드. 무료·무제한이라 수백 콜도 부담 없다.
+    # Gemini는 폐기하지 않고(CEO 지시) 이 값을 "gemini"로 바꿔 선택할 수 있게 열어둔다.
+    community_report_bulk_backend: str = "ollama"
+    # 최상위 레벨(소수·고가치) 리포트 생성 기본 백엔드. 재빌드당 몇십 콜 수준이라 쿼터 부담이 적다.
+    community_report_top_backend: str = "claude_cli"
+    # 레벨 0(최상위)부터 이 개수만큼의 레벨을 top 백엔드로, 나머지(대량)는 bulk 백엔드로 라우팅한다.
+    report_cli_top_levels: int = 1
+
+    # --- 글로벌(map-reduce) 검색(M4, 옵트인 질의) 설정 — spec-addendum §A 라우팅 정책 ---
+    # MAP 단계(스코프 내 리포트마다 1콜, 대량) 기본 백엔드. 무료·무제한이라 리포트 수가 많아도 부담 없다.
+    # Gemini는 폐기하지 않고(CEO 지시) 이 값을 "gemini"로 바꿔 선택할 수 있게 열어둔다.
+    global_search_map_backend: str = "ollama"
+    # REDUCE 단계(질의당 1콜, 소수) 기본 백엔드. config로 "claude_cli"를 옵트인하면 고품질 단발 종합이 가능하다.
+    global_search_reduce_backend: str = "ollama"
+    # 글로벌 검색 기본 레벨(레벨 0 = 최상위, community_max_level 주석과 동일 규칙). --level로 질의별 오버라이드 가능.
+    global_search_default_level: int = 0
+    # 리프 리포트에 담을 '외부 연결'(커뮤니티 경계를 넘는 관계) 최대 개수 — 프롬프트 폭주 방지 상한.
+    community_report_external_max: int = 20
+
+    # --- 로컬 질의(answer_question) 답변 합성 백엔드 ---
+    # 완전 로컬(무과금) 운영이 이 프로젝트의 기본이라 ollama로 둔다. Gemini 키가 있고 flash-lite 합성을
+    # 원하면 .env에서 ANSWER_BACKEND=gemini로 되돌린다(그때만 RPD 한도에 잡힌다). query --backend로 질의별 오버라이드 가능.
+    answer_backend: str = "ollama"
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:

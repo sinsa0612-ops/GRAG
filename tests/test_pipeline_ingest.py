@@ -31,6 +31,25 @@ def test_process_file_extracts_and_stores(tmp_path, monkeypatch):
     assert "강택리" in names
 
 
+def test_process_file_marks_collection_communities_dirty(tmp_path, monkeypatch):
+    # [M2] 인제스트는 값싼 기본 경로를 유지하면서도(LLM 커뮤니티 작업 0), 해당 컬렉션을
+    # '커뮤니티 재빌드 필요'로만 표시해야 한다(addendum §C-3 — 그래프 변이 계층에서의 dirty 마킹).
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert sqlite_manager.is_communities_dirty(C) is True  # 아직 빌드된 적 없음 — 기본이 dirty
+    sqlite_manager.clear_communities_dirty(C, "이전-서명")  # 방금 빌드해서 깨끗해졌다고 가정
+
+    assert ingest.process_file(file_path, C) is True
+
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+
 def test_process_file_skips_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
     monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
@@ -227,6 +246,7 @@ def test_resolve_canonical_name_keeps_genuinely_new_name():
 
 def test_store_extraction_merges_known_alias_instead_of_creating_new_node():
     graph_manager.init_schema()
+    sqlite_manager.init_schema()  # [M1.5] store_extraction이 설명 후보도 sqlite에 병행 적재하므로 필요
     graph_manager.upsert_entity(C, "ISA계좌", "Asset", "절세용 계좌")
     graph_manager.add_alias(C, "ISA계좌", "ISA 계좌")
 
@@ -277,6 +297,82 @@ def test_glean_chunk_dedupes_repeated_entities(monkeypatch):
     assert extra_calls == 1  # 첫 라운드에서 새 게 없어 바로 종료
 
 
+# --- M1.5: 설명 후보(entity_desc_candidates) 적재 + hot-path 불변 ---
+
+
+def test_store_extraction_fills_description_and_records_candidate():
+    # hot-path 회귀 방지: description은 지금처럼 즉시 채워지고(로컬 질의가 그걸 씀),
+    # source_doc 키의 후보도 '병행 추가'로 함께 적재돼야 한다(둘 다, 후자만이 아님).
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="기획자")], relations=[]
+    )
+    ingest.store_extraction(C, result, "doc1")
+
+    entity = graph_manager.get_entity(C, "강택리")
+    assert entity["description"] == "기획자"  # hot-path 불변
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["기획자"]
+
+
+def test_store_extraction_keys_candidates_by_source_doc():
+    # 같은 엔티티가 다른 문서에서 다시 언급되면, source_doc이 다른 별개 후보로 쌓여야 한다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result_doc1 = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="1번 문서 설명")], relations=[]
+    )
+    result_doc2 = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="2번 문서 설명")], relations=[]
+    )
+    ingest.store_extraction(C, result_doc1, "doc1")
+    ingest.store_extraction(C, result_doc2, "doc2")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["1번 문서 설명", "2번 문서 설명"]
+    # hot-path description은 가장 최근 upsert 값으로 남아있어야 한다(현행 동작 불변).
+    assert graph_manager.get_entity(C, "강택리")["description"] == "2번 문서 설명"
+
+
+def test_store_extraction_skips_candidate_for_empty_description():
+    # 빈 description은 통합할 재료가 아니므로 후보로 남기지 않는다(빈 문자열이 카운트를 오염시키지 않게).
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="")], relations=[]
+    )
+    ingest.store_extraction(C, result, "doc1")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == []
+
+
+def test_process_file_records_desc_candidates_end_to_end(tmp_path, monkeypatch):
+    # ingest CLI 경로(process_file) 전체를 통해서도 후보가 source_doc 키로 남는지 확인한다.
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+    ingest.process_file(file_path, C)
+
+    source_id = sqlite_manager.get_document_source_id(C, "memo.md")
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["기획자"]
+    # 저장된 후보가 실제로 그 문서의 source_id를 키로 쓰는지 확인(캐스케이드 삭제가 정확히 짚을 수 있어야 함).
+    with sqlite_manager.get_connection() as conn:
+        row = conn.execute(
+            "SELECT source_doc FROM entity_desc_candidates WHERE collection = ? AND entity_name = ?",
+            (C, "강택리"),
+        ).fetchone()
+    assert row[0] == source_id
+
+
 def test_process_file_gleaning_adds_missed_entities(tmp_path, monkeypatch):
     # process_file에 glean_rounds=1을 주면, 1차(에이)에 이어 gleaning이 찾은 비이도 저장돼야 한다.
     def fake_generate(prompt, **kwargs):
@@ -295,3 +391,59 @@ def test_process_file_gleaning_adds_missed_entities(tmp_path, monkeypatch):
     assert ingest.process_file(file_path, C, glean_rounds=1) is True
     names = {e["name"] for e in graph_manager.get_all_entities()}
     assert {"에이", "비이"} <= names
+
+
+# --- 추출 백엔드 선택(--backend) + RPD 한도 기록 스킵 ---
+
+
+def test_process_file_ollama_backend_skips_rpd_usage(tmp_path, monkeypatch):
+    # ollama(로컬 무료)/CLI(구독) 백엔드는 Gemini 일일 한도(RPD)와 무관하므로 record_api_usage를 호출하면 안 된다.
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    calls = {"n": 0}
+    monkeypatch.setattr(sqlite_manager, "record_api_usage", lambda n: calls.__setitem__("n", calls["n"] + 1))
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, backend="ollama") is True
+    assert calls["n"] == 0  # 로컬/구독 백엔드는 RPD를 소비하지 않음
+
+
+def test_process_file_default_backend_records_rpd_usage(tmp_path, monkeypatch):
+    # 대조군: 기본(Gemini) 백엔드는 기존대로 청크 수만큼 RPD를 기록해야 한다(스킵이 무조건이 아님을 고정).
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    calls = {"n": 0}
+    monkeypatch.setattr(sqlite_manager, "record_api_usage", lambda n: calls.__setitem__("n", calls["n"] + 1))
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C) is True  # backend 미지정 = Gemini
+    assert calls["n"] >= 1  # 기존 RPD 기록 경로 불변
+
+
+def test_process_file_forwards_backend_to_generate(tmp_path, monkeypatch):
+    # process_file → extract_chunk → generate 로 backend 문자열이 그대로 전달돼야 한다(라우터가 어댑터를 고를 수 있게).
+    seen_backends = []
+
+    def capturing_generate(prompt, **kwargs):
+        seen_backends.append(kwargs.get("backend"))
+        return VALID_RESPONSE
+
+    monkeypatch.setattr(ingest, "generate", capturing_generate)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    monkeypatch.setattr(sqlite_manager, "record_api_usage", lambda n: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    ingest.process_file(file_path, C, backend="ollama")
+    assert seen_backends and all(b == "ollama" for b in seen_backends)

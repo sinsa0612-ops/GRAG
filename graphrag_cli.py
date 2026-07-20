@@ -98,6 +98,11 @@ def cmd_ingest(args) -> None:
     import process_inbox
 
     collection = args.collection or settings.default_collection
+    backend = getattr(args, "backend", None)
+    # ollama(로컬 무료)·claude_cli/codex_cli(구독)는 Gemini 일일 한도(RPD)와 무관 → 한도 가드/사용량 기록을 건너뛴다.
+    _is_gemini = backend in (None, "gemini")
+    if not _is_gemini:
+        print(f"추출 백엔드: {backend} (로컬/구독 — Gemini 하루 한도 미적용)")
 
     # 1) 처리 대상 파일 목록 결정
     if args.inbox:
@@ -143,8 +148,8 @@ def cmd_ingest(args) -> None:
         print("(--dry-run: 실제 처리는 하지 않았습니다)")
         return
 
-    # 3) 한도 가드
-    if used + total_est > limit and not args.force:
+    # 3) 한도 가드 (Gemini만 — ollama/CLI는 로컬/구독이라 RPD 무관)
+    if _is_gemini and used + total_est > limit and not args.force:
         print(f"\n⛔ 한도 초과 예상: {used} + {total_est} = {used + total_est} > {limit}  — 처리를 중단합니다.")
         _print_split_guidance(estimates, max(0, remaining), limit, multiplier)
         print("그래도 강행하려면 --force 를 붙이세요.")
@@ -158,7 +163,7 @@ def cmd_ingest(args) -> None:
         return
     for path, _ in estimates:
         try:
-            changed = ingest.process_file(path, collection, glean_rounds=glean)
+            changed = ingest.process_file(path, collection, glean_rounds=glean, backend=backend)
         except Exception as exc:
             failed_dir = settings.failed_dir / collection
             failed_dir.mkdir(parents=True, exist_ok=True)
@@ -186,7 +191,7 @@ def cmd_usage(args) -> None:
 # 문서를 컬렉션에서 삭제한다(벡터 청크 + 관계 + 문서 기록). 그로 인해 고립된 엔티티도 정리한다.
 # 잘못된 컬렉션으로 추출했을 때 되돌리는 용도. 단, 다른 엔티티와 연결된 채 남은 노드는 자동 삭제되지 않는다.
 def cmd_delete(args) -> None:
-    from db import document_store, graph_manager
+    from db import document_store, graph_manager, sqlite_manager
 
     collection = args.collection or settings.default_collection
     for f in args.files:
@@ -194,6 +199,10 @@ def cmd_delete(args) -> None:
         ok = document_store.delete_document(collection, name)
         print(f"[{collection}] {name}: {'삭제됨' if ok else '문서를 찾을 수 없음'}")
     removed = graph_manager.cleanup_isolated_entities([collection])
+    # [M2] 고립 엔티티 정리는 그래프 변이(엔티티 삭제)다 — delete_document가 이미 dirty를 세우지만,
+    # 문서 삭제가 없었어도(no-op) cleanup이 기존 고립 엔티티를 지우면 커뮤니티 멤버십이 바뀌므로 여기서도 표시한다.
+    if removed:
+        sqlite_manager.mark_communities_dirty(collection)
     print(f"고립된 엔티티 {removed}개 정리됨")
 
 
@@ -205,11 +214,44 @@ def cmd_delete_collection(args) -> None:
     print(f"컬렉션 '{args.collection}' 삭제 완료 (문서 {count}개 + 엔티티/관계/청크)")
 
 
-# 추출된 그래프+벡터 정보만 근거로 질문에 답한다.
+# [M4] 글로벌(map-reduce) 질의를 실행한다. 스코프 컬렉션 중 하나라도 커뮤니티가 stale(재빌드 필요 —
+# 한 번도 안 빌드됐거나 마지막 빌드 이후 그래프가 바뀐 경우 모두 포함, is_communities_dirty가 두 경우를
+# 함께 판정한다)이면 재빌드 안내를 먼저 보여준 뒤, 사용자가 질문에 대한 답 없이 끝나지 않도록 로컬
+# 검색으로 즉시 폴백한다([ASSUMPTION] 안내만 하고 종료하는 대신 자동 로컬 폴백을 택함 — m4-result.md 근거).
+def _cmd_query_global(args) -> None:
+    from db import graph_manager, sqlite_manager
+    from query import answer_question, answer_question_global
+
+    collections = _collections_from_args(args)
+    target = collections if collections is not None else sorted(
+        set(sqlite_manager.get_collection_doc_counts()) | set(graph_manager.get_all_collections())
+    )
+    stale = [c for c in target if sqlite_manager.is_communities_dirty(c)]
+    if stale:
+        print(
+            f"⚠️ 커뮤니티가 없거나 오래됨(재빌드 필요): {', '.join(stale)} "
+            f"— 먼저 `graphrag communities build --collection <이름>`을 실행하세요."
+        )
+        print("(우선 로컬 검색으로 답합니다)")
+        print(answer_question(args.question, collections=collections))
+        return
+    print(answer_question_global(args.question, collections=collections, level=args.level))
+
+
+# 추출된 그래프+벡터 정보만 근거로 질문에 답한다. --mode global이면 커뮤니티 리포트(M3) 위에서
+# map-reduce로 종합 답변한다(M4, _cmd_query_global). 기본(local)은 기존과 완전히 동일한 코드 경로다
+# (hot-path 불변 — mode 분기가 없던 시절과 바이트 동일하게 answer_question을 호출한다).
 def cmd_query(args) -> None:
+    if getattr(args, "mode", "local") == "global":
+        _cmd_query_global(args)
+        return
+
     from query import answer_question
 
-    print(answer_question(args.question, collections=_collections_from_args(args)))
+    print(answer_question(
+        args.question, collections=_collections_from_args(args),
+        backend=getattr(args, "backend", None),
+    ))
 
 
 # 그래프를 Gephi용 GEXF로 내보낸다. -o 로 경로를 지정하면 그곳에, 아니면 exports/에 저장한다.
@@ -284,6 +326,69 @@ def cmd_merge(args) -> None:
 
     entity_resolution.run(_collections_from_args(args))
     print("병합 작업 완료")
+
+
+# 설명 후보가 min_candidates개 이상 쌓인 엔티티만 로컬 LLM(기본 Ollama)으로 통합 요약한다(옵트인 배치, M1.5).
+def cmd_summarize_descriptions(args) -> None:
+    from pipeline import desc_summarizer
+
+    updated = desc_summarizer.summarize_descriptions(args.collection, min_candidates=args.min_candidates)
+    print(f"[{args.collection}] 설명 통합 완료: {updated}개 엔티티")
+
+
+# 컬렉션별 커뮤니티/리포트 현황(개수·재빌드 필요 여부)을 출력한다(communities status, M3).
+# collections가 None이면 문서/그래프 어느 쪽에든 존재가 확인된 모든 컬렉션을 대상으로 한다.
+def _print_communities_status(collections: list[str] | None) -> None:
+    from db import graph_manager, sqlite_manager
+
+    if collections is None:
+        collections = sorted(
+            set(sqlite_manager.get_collection_doc_counts()) | set(graph_manager.get_all_collections())
+        )
+    if not collections:
+        print("(아직 컬렉션이 없습니다)")
+        return
+    for collection in collections:
+        n_communities = len(sqlite_manager.get_communities(collection))
+        n_reports = len(sqlite_manager.get_community_reports(collection))
+        stale = " ⚠️ stale(재빌드 필요)" if sqlite_manager.is_communities_dirty(collection) else ""
+        print(f"- {collection}: 커뮤니티 {n_communities}개, 리포트 {n_reports}개{stale}")
+
+
+# 커뮤니티 탐지(Leiden, 컬렉션별) + 리포트 생성(M3)을 실행해 SQLite에 저장하거나, 현황을 출력한다.
+# build: 탐지(순수 CPU)는 항상 실행하고, 그 위에 기본으로 리포트(LLM 배치)까지 생성한다(--no-reports로
+# 건너뛸 수 있음). 탐지가 끝까지 완주했을 때만 dirty를 해제한다(크래시 안전 — 리포트 생성 단계의 개별
+# 실패는 community_reporter가 해당 커뮤니티만 건너뛰므로 dirty 해제 여부에 영향을 주지 않는다).
+# status: 컬렉션별 커뮤니티/리포트 개수와 stale 여부를 보여준다(--collection 생략 시 전체).
+def cmd_communities(args) -> None:
+    from db import sqlite_manager
+    from pipeline import community_detector
+
+    if args.action == "status":
+        _print_communities_status(_collections_from_args(args))
+        return
+
+    if args.action == "build":
+        if not args.collection:
+            print("build는 --collection이 필요합니다.")
+            return
+        collection = args.collection
+        print(f"[{collection}] 커뮤니티 탐지 중(Leiden, 순수 CPU)...")
+        communities, graph_signature = community_detector.detect_communities(collection)
+        sqlite_manager.replace_communities(collection, communities)
+        sqlite_manager.clear_communities_dirty(collection, graph_signature)
+        if not communities:
+            print(f"[{collection}] 엔티티가 없어 커뮤니티가 생성되지 않았습니다.")
+            return
+        levels = sorted({c["level"] for c in communities})
+        print(f"[{collection}] 커뮤니티 {len(communities)}개 저장 완료 (레벨 {levels})")
+
+        if not args.no_reports:
+            from pipeline import community_reporter
+
+            print(f"[{collection}] 커뮤니티 리포트 생성 중(bottom-up, 레벨별 백엔드 라우팅 — 시간이 걸릴 수 있습니다)...")
+            n_reports = community_reporter.generate_reports(collection)
+            print(f"[{collection}] 리포트 {n_reports}개 생성 완료")
 
 
 # "컬렉션:이름" 형식 인자를 (컬렉션, 이름)으로 가른다. 형식이 틀리면 None.
@@ -431,6 +536,10 @@ def main(argv: list[str] | None = None) -> None:
         "--glean", type=int, default=0, metavar="N",
         help="청크당 gleaning(놓친 것 추가 추출) 라운드 수. 요청 수가 최대 (1+N)배로 늘어난다. 기본 0=끔",
     )
+    p_ingest.add_argument(
+        "--backend", choices=["gemini", "ollama", "claude_cli", "codex_cli"], default=None,
+        help="추출 LLM 백엔드(기본: Gemini). ollama=로컬 무료(RPD 한도 미적용), claude_cli/codex_cli=구독.",
+    )
     p_ingest.set_defaults(func=cmd_ingest)
 
     sub.add_parser("usage", help="오늘 LLM 요청 사용량/남은 한도").set_defaults(func=cmd_usage)
@@ -448,6 +557,17 @@ def main(argv: list[str] | None = None) -> None:
     p_query.add_argument("question", help="질문 내용")
     p_query.add_argument("--collection", help="범위 컬렉션(쉼표로 여러 개)")
     p_query.add_argument("--all", action="store_true", help="전체 컬렉션 종합(행정 종합)")
+    p_query.add_argument(
+        "--mode", choices=["local", "global"], default="local",
+        help="local(기본)=그래프+벡터 직접 검색, global=커뮤니티 리포트 위 map-reduce 종합 검색(M4, communities build 선행 필요)",
+    )
+    p_query.add_argument(
+        "--level", type=int, help="글로벌 검색 전용: 조회할 커뮤니티 레벨(0=최상위, 미지정 시 설정 기본값)",
+    )
+    p_query.add_argument(
+        "--backend", choices=["gemini", "ollama", "claude_cli", "codex_cli"], default=None,
+        help="로컬 검색 답변 합성 백엔드(미지정 시 설정 기본=ollama 무과금). gemini는 키·RPD 한도 필요.",
+    )
     p_query.set_defaults(func=cmd_query)
 
     p_graph = sub.add_parser("graph", help="Gephi용 GEXF 내보내기")
@@ -467,6 +587,28 @@ def main(argv: list[str] | None = None) -> None:
     p_merge.add_argument("--collection", help="범위 컬렉션(쉼표로 여러 개)")
     p_merge.add_argument("--all", action="store_true", help="전체 컬렉션")
     p_merge.set_defaults(func=cmd_merge)
+
+    p_summarize = sub.add_parser(
+        "summarize-descriptions", help="설명 후보를 로컬 LLM(Ollama)으로 통합 요약(옵트인 배치)"
+    )
+    p_summarize.add_argument("--collection", required=True, help="대상 컬렉션(사업) 이름")
+    p_summarize.add_argument(
+        "--min-candidates", type=int, dest="min_candidates",
+        help="통합 요약을 트리거할 최소 후보 수(기본: 설정값)",
+    )
+    p_summarize.set_defaults(func=cmd_summarize_descriptions)
+
+    p_communities = sub.add_parser(
+        "communities", help="커뮤니티 탐지(Leiden) + 리포트 생성(M3) — 글로벌 검색은 이후 마일스톤"
+    )
+    p_communities.add_argument("action", choices=["build", "status"], help="동작")
+    p_communities.add_argument(
+        "--collection", help="대상 컬렉션(사업) 이름 (build는 필수, status는 생략 시 전체·쉼표로 여러 개)"
+    )
+    p_communities.add_argument(
+        "--no-reports", action="store_true", help="build 시 리포트(LLM 배치) 생성을 건너뛰고 탐지만 수행"
+    )
+    p_communities.set_defaults(func=cmd_communities)
 
     p_bridge = sub.add_parser("bridge", help="컬렉션 간 같은 대상 연결(SAME_AS 브릿지)")
     p_bridge.add_argument("action", choices=["add", "remove", "list", "suggest"], help="동작")

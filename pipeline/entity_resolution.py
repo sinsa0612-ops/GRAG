@@ -110,6 +110,8 @@ def run(collections: list[str] | None = None) -> None:
 
     total = 0
     for collection in target_collections:
+        merged_in_collection = 0
+
         # ① 표기만 다른 중복(공백·구두점)을 임베딩 없이 먼저 합친다.
         normalized_pairs = find_normalized_duplicates(collection)
         if normalized_pairs:
@@ -119,6 +121,7 @@ def run(collections: list[str] | None = None) -> None:
                 graph_manager.add_alias(collection, keep, drop)
                 graph_manager.merge_entity_into(collection, keep_name=keep, drop_name=drop)
             total += len(normalized_pairs)
+            merged_in_collection += len(normalized_pairs)
 
         # ② 남은 노드를 임베딩 유사도로 비교해 의미가 같은 것을 합친다.
         candidates = find_merge_candidates(collection)
@@ -126,6 +129,12 @@ def run(collections: list[str] | None = None) -> None:
             ensure_backup()
             apply_merges(collection, candidates)
             total += len(candidates)
+            merged_in_collection += len(candidates)
+
+        # [M2] 그래프 구조가 바뀌었으니 이 컬렉션의 커뮤니티는 재빌드가 필요하다(수동 병합·블랙리스트
+        # 해제 후 재병합 모두 이 run()을 거치므로, addendum §C-3이 요구하는 두 경우를 여기서 함께 커버한다).
+        if merged_in_collection:
+            sqlite_manager.mark_communities_dirty(collection)
 
     if total == 0:
         logger.info("병합 후보가 없습니다.")

@@ -138,13 +138,22 @@ def render_status_tab() -> None:
 
 # 처리 예정 (파일명, 본문) 목록으로 예상 요청 수와 오늘 한도를 보여주고, 초과 시 막을지 결정한다.
 # 반환: (진행 가능 여부, 예상 합계). force=True면 초과여도 진행 가능으로 둔다(graphrag ingest의 한도 가드와 동일).
-def _estimate_and_guard(items: list[tuple[str, str]], force: bool, glean: int = 0) -> tuple[bool, int]:
+# is_gemini=False(ollama/CLI 백엔드)면 Gemini 일일 한도(RPD)와 무관하므로 예상 청크 수만 안내하고 절대 막지 않는다.
+def _estimate_and_guard(
+    items: list[tuple[str, str]], force: bool, glean: int = 0, is_gemini: bool = True
+) -> tuple[bool, int]:
     from db import document_store
 
     # gleaning이 켜지면 청크당 최대 (1+glean)회 호출된다 → 예상/한도 계산에 곱한다.
     multiplier = 1 + max(0, glean)
     estimates = [(name, document_store.estimate_request_count(text)) for name, text in items]
     total = sum(n for _, n in estimates) * multiplier
+
+    if not is_gemini:
+        # 로컬(ollama)/구독(CLI) 백엔드: RPD 한도 없음 → 청크 수만 안내하고 항상 진행 가능.
+        st.caption(f"예상 청크(호출) 수: 총 **{total}** — 로컬/구독 백엔드라 하루 한도(RPD)에 안 잡힙니다.")
+        return True, total
+
     used = sqlite_manager.get_api_usage_today()
     limit = settings.llm_daily_limit
     remaining = max(0, limit - used)
@@ -189,7 +198,9 @@ def _post_ingest(collection: str, no_merge: bool) -> None:
 
 
 # 업로드된 파일들을 임시폴더에 풀어 한 건씩 처리하고, 성공/실패에 따라 processed/·failed/로 복사한다.
-def _run_ingest_uploaded(uploaded_files, collection: str, no_merge: bool, glean: int = 0) -> None:
+def _run_ingest_uploaded(
+    uploaded_files, collection: str, no_merge: bool, glean: int = 0, backend: str | None = None
+) -> None:
     from pipeline import ingest
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -198,7 +209,9 @@ def _run_ingest_uploaded(uploaded_files, collection: str, no_merge: bool, glean:
             tmp_path.write_bytes(uploaded_file.getvalue())
             with st.spinner(f"{uploaded_file.name} 처리 중..."):
                 try:
-                    changed = ingest.process_file(tmp_path, collection, glean_rounds=glean)
+                    changed = ingest.process_file(
+                        tmp_path, collection, glean_rounds=glean, backend=backend
+                    )
                     dest = settings.processed_dir / collection
                     dest.mkdir(parents=True, exist_ok=True)
                     shutil.copy(tmp_path, dest / uploaded_file.name)
@@ -215,21 +228,38 @@ def _run_ingest_uploaded(uploaded_files, collection: str, no_merge: bool, glean:
 
 
 # inbox/ 폴더 전체를 지정 컬렉션으로 일괄 처리한다(graphrag ingest --inbox와 동일).
-def _run_ingest_inbox(collection: str, no_merge: bool, glean: int = 0) -> None:
+def _run_ingest_inbox(
+    collection: str, no_merge: bool, glean: int = 0, backend: str | None = None
+) -> None:
     import process_inbox
 
     with st.spinner("inbox/ 처리 중..."):
-        process_inbox.process_inbox(collection, glean_rounds=glean)
+        process_inbox.process_inbox(collection, glean_rounds=glean, backend=backend)
     st.success(f"inbox/ 처리 완료 (컬렉션: {collection})")
     _post_ingest(collection, no_merge)
 
 
 # 문서 추출+그래프 생성(ingest) 탭 — 업로드/inbox, 예상 요청 수·한도 가드, force/no-merge 옵션.
-def render_ingest_tab() -> None:
-    if not settings.gemini_api_key:
-        st.warning("`.env`에 GEMINI_API_KEY가 없습니다 — 추출이 실패할 수 있습니다.")
+# GUI 백엔드 라벨 → process_file backend 인자. "Gemini(기본)"은 None으로 넘겨 기존 hot-path와 100% 동일하게 둔다.
+_INGEST_BACKENDS = {
+    "Gemini (기본)": None,
+    "Ollama (로컬 무료)": "ollama",
+    "Claude CLI (구독)": "claude_cli",
+    "Codex CLI (구독)": "codex_cli",
+}
 
+
+def render_ingest_tab() -> None:
     collection = _pick_collection("ingest")
+    backend_label = st.selectbox(
+        "추출 백엔드", list(_INGEST_BACKENDS), key="ingest_backend",
+        help="Gemini=하루 한도(RPD) 적용. Ollama=로컬 무료(느리지만 무제한). Claude/Codex CLI=구독.",
+    )
+    backend = _INGEST_BACKENDS[backend_label]
+    is_gemini = backend in (None, "gemini")
+    if is_gemini and not settings.gemini_api_key:
+        st.warning("`.env`에 GEMINI_API_KEY가 없습니다 — Gemini 추출은 실패합니다. 로컬을 쓰려면 'Ollama'를 고르세요.")
+
     source = st.radio(
         "처리할 대상", ["업로드한 파일", "inbox/ 폴더 일괄"], horizontal=True, key="ingest_src"
     )
@@ -255,9 +285,9 @@ def render_ingest_tab() -> None:
         items = [
             (f.name, f.getvalue().decode("utf-8", errors="replace")) for f in uploaded_files
         ]
-        allowed, _ = _estimate_and_guard(items, force, glean)
+        allowed, _ = _estimate_and_guard(items, force, glean, is_gemini)
         if st.button("추출 + 그래프 생성 시작", disabled=not allowed, key="ingest_run_uploaded"):
-            _run_ingest_uploaded(uploaded_files, collection, no_merge, glean)
+            _run_ingest_uploaded(uploaded_files, collection, no_merge, glean, backend)
     else:
         settings.inbox_dir.mkdir(parents=True, exist_ok=True)
         inbox_files = sorted(p for p in settings.inbox_dir.iterdir() if p.is_file())
@@ -265,9 +295,9 @@ def render_ingest_tab() -> None:
             st.info(f"inbox/ 폴더가 비어 있습니다: {settings.inbox_dir}")
             return
         items = [(p.name, p.read_text(encoding="utf-8", errors="replace")) for p in inbox_files]
-        allowed, _ = _estimate_and_guard(items, force, glean)
+        allowed, _ = _estimate_and_guard(items, force, glean, is_gemini)
         if st.button("inbox/ 일괄 처리 시작", disabled=not allowed, key="ingest_run_inbox"):
-            _run_ingest_inbox(collection, no_merge, glean)
+            _run_ingest_inbox(collection, no_merge, glean, backend)
 
 
 # ───────────────────────── 💬 질문 탭 ─────────────────────────
@@ -275,23 +305,55 @@ def render_ingest_tab() -> None:
 
 # 추출된 그래프+벡터 정보만 근거로 질문에 답하는 탭(graphrag query). 범위는 전체 또는 특정 컬렉션.
 def render_query_tab() -> None:
-    if not settings.gemini_api_key:
-        st.warning("`.env`에 GEMINI_API_KEY가 없습니다 — 답변 생성이 실패할 수 있습니다.")
-
     scope = _pick_scope("query")
     st.caption(f"범위: {_scope_label(scope)} · 그래프에 등록된 이름을 그대로 쓰면 정확도가 올라갑니다.")
+    mode = st.radio(
+        "검색 방식", ["로컬 (기본)", "글로벌 (주제·종합)"], horizontal=True, key="query_mode"
+    )
+    # 답변 합성 백엔드 — 기본 Ollama(무과금). 백엔드는 ingest 탭과 동일 집합을 재사용한다.
+    _labels = list(_INGEST_BACKENDS)
+    _default_idx = list(_INGEST_BACKENDS.values()).index("ollama")
+    backend_label = st.selectbox(
+        "답변 백엔드", _labels, index=_default_idx, key="query_backend",
+        help="로컬 검색 답변을 어느 모델로 합성할지. 기본 Ollama=무과금. Gemini는 키·RPD 한도 필요.",
+    )
+    backend = _INGEST_BACKENDS[backend_label]
+    if backend in (None, "gemini") and not settings.gemini_api_key:
+        st.warning("`.env`에 GEMINI_API_KEY가 없습니다 — Gemini 답변은 실패합니다. 'Ollama'를 고르면 무과금으로 답합니다.")
     question = st.text_area("질문", placeholder="예: 김부장은 무슨 일을 해?", key="query_q")
 
     if st.button("질문하기", disabled=not question.strip(), key="query_run"):
-        from query import answer_question
-
         with st.spinner("답변 생성 중..."):
             try:
-                answer = answer_question(question.strip(), collections=scope)
+                if mode.startswith("글로벌"):
+                    answer = _answer_global_with_fallback(question.strip(), scope, backend)
+                else:
+                    from query import answer_question
+
+                    answer = answer_question(question.strip(), collections=scope, backend=backend)
                 st.markdown("### 답변")
                 st.write(answer)
             except Exception as exc:
                 st.error(f"질문 처리 실패: {exc}")
+
+
+# [M4] 글로벌(map-reduce) 질의를 실행한다. 스코프 중 커뮤니티가 stale(재빌드 필요 — 미빌드 포함,
+# is_communities_dirty가 둘 다 판정)인 컬렉션이 있으면 CLI(--mode global)와 같은 논리로 재빌드 안내를
+# 띄운 뒤 로컬 검색 답변으로 즉시 폴백한다.
+def _answer_global_with_fallback(
+    question: str, scope: list[str] | None, backend: str | None = None
+) -> str:
+    from query import answer_question, answer_question_global
+
+    target = scope if scope is not None else _list_collections()
+    stale = [c for c in target if sqlite_manager.is_communities_dirty(c)]
+    if stale:
+        st.warning(
+            f"커뮤니티가 없거나 오래됨(재빌드 필요): {', '.join(stale)} "
+            f"— 먼저 `graphrag communities build --collection <이름>`을 실행하세요. 우선 로컬 검색으로 답합니다."
+        )
+        return answer_question(question, collections=scope, backend=backend)
+    return answer_question_global(question, collections=scope, level=None)
 
 
 # ───────────────────────── 🕸️ 그래프 탭 ─────────────────────────

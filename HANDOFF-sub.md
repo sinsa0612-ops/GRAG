@@ -2,6 +2,137 @@
 
 > AI 주도권 문서. 세션별 세부 변경 이력·현재 상태·미해결 문제·다음 단계를 기록한다.
 
+## 📅 2026-07-20 세션 (2) — 커뮤니티/글로벌층 실전 E2E 검증 + 완전 무과금화
+
+> 브랜치: `feat/graphrag-full`. 이 세션 커밋 4개: `1ecbb0a`(추출 백엔드 실사용화)·`e4bf06c`(로컬 Q&A
+> 무과금)·`78cd53a`(외부 연결)·`db63323`(M5 증분). 앞선 M1~M4(`5f841f6`~`60cae1a`)는 커밋됐으나
+> HANDOFF 미기록이었어서, 아래에서 실전 검증과 함께 상태를 확정한다.
+
+### 배경 — 단위테스트는 초록인데 실제로 돌려본 적이 없었다
+- `feat/graphrag-full`에 M1~M4(LLM 백엔드 라우터·설명통합·Leiden 커뮤니티·리포트·글로벌 map-reduce)가
+  이미 커밋돼 있었으나 **실데이터 E2E 미검증**. 또한 이 머신은 `.env`가 없어 **Gemini 키가 아예 없다**
+  (main·워크트리 둘 다). 즉 전 구간이 로컬(무과금)로 돌아야 하는 구성.
+
+### 🔴 실전에서 드러난 결함과 근본 수정 (E2E가 아니면 못 잡았을 것)
+1. **로컬 추출 100% 고장 → 고침(`1ecbb0a`).** 실문서 인제스트 시 청크마다 120초 타임아웃 → 엔티티 0개.
+   근본 원인 ①`local_llm_adapter`가 qwen3 추론(`<think>`)을 안 꺼 느림 → `think:false`로 차단(짧은 청크
+   120초→13초). ②실제 1960자 청크는 그래도 qwen3:14b가 실측 **~250초** → `ollama_request_timeout_sec`
+   120→300초. 단위테스트는 `generate`를 목킹해 이 결함을 못 잡았다.
+   - 겸사겸사 `ingest --backend {gemini,ollama,claude_cli,codex_cli}` 옵션 완성(비-Gemini는 RPD 가드/기록
+     스킵), GUI ingest 탭 백엔드 선택 배선, 테스트 +5.
+2. **로컬 Q&A가 Gemini 고정 = 무과금의 구멍 → 고침(`e4bf06c`).** 핵심 로컬 질의 `answer_question`이
+   hot-path 보존으로 Gemini에 묶여, 키 없는 이 머신에선 "No API key"로 완전히 막혔다. `config.answer_backend`
+   (기본 ollama) + `query --backend` + GUI 답변 백엔드 선택 배선. backend가 gemini/None이면 프롬프트·검색·호출
+   바이트 동일(hot-path 보존), 비-Gemini는 RPD 기록 스킵.
+
+### ✅ E2E 검증 (실문서 8천자 → 로컬 ollama 전 구간, 스크래치 DB 격리)
+- 실문서(3기관 얽힌 클러스터 사업) 인제스트: 엔티티 25·관계 25·벡터 2청크.
+- **M2 Leiden:** 커뮤니티 6개가 실제 하위조직과 정확히 일치(배터리팀/수소팀/대학/스타트업/연구소코어/우산사업). LLM 0회.
+- **M3 리포트:** 6개 모두 원문 충실 한국어 요약 + rating(로컬 qwen3).
+- **M4 글로벌:** 리포트 수집→map 6/6 관련(rel=10)→reduce가 전 커뮤니티 아우르는 주제 종합 생성. "연결" 질문엔
+  리포트에 없는 정보를 지어내지 않고 정직하게 "정보 없음"(충실성) → 아래 외부연결로 개선.
+- **로컬 질의(무과금):** "김도현 박사..." → "차세대 배터리 팀에서 리튬황 전지 양극재 열화 연구, 박서준·정하늘과
+  함께" 충실·정확 답변(Gemini 없이).
+
+### 🟢 추가 고도화 2건
+3. **글로벌 교차연결(`78cd53a`).** 리프 리포트가 커뮤니티 내부 관계만 담아 "그룹 간 연결" 질문에 약했다.
+   경계를 넘는 관계(XOR 멤버십)를 '외부 연결'로 리포트에 포함(`community_report_external_max=20` 상한).
+   재검증: 전엔 "정보 없음"이던 연결 질문이 "한빛에너지연구소↔서강해양대 관련"으로 교차연결 표면화
+   (그래프 교차엣지 4개 전부 반영). 남은 약점(그린모빌리티 연결)은 리포트 설계가 아니라 **추출 recall**
+   문제(김도현↔배준혁 관계가 애초에 추출 안 됨).
+4. **M5 증분 재계산(`db63323`).** 리포트 재빌드가 매번 전량 LLM 재요약하던 것을, 입력이 그대로면 재사용.
+   ⚠️ 순진한 "멤버십(community_id) 해시" 재사용은 **불안전**(설명·관계 변경 미반영, 예: `summarize-descriptions`
+   후)이라, 멤버+설명+내부/외부관계를 아우르는 `content_signature` 기반으로 구현(스키마 컬럼 추가+마이그레이션).
+   E2E: 재빌드 "재사용 6 / 재생성 0", **0초**(전엔 6콜 ~6분).
+
+### 현재 상태
+- `pytest -q` **261 passed, 6 skipped**(실LLM 스모크는 `GRAG_RUN_LLM_SMOKE=1`에서만).
+- Ollama qwen3:14b 가동 확인. 로컬 추출 ~250초/청크(느리지만 무제한·무과금 — Gemini 폴백 없는 이 머신의 유일 경로).
+
+### ⚠️ 알려진 한계 / 다음 후보
+1. **추출 속도:** qwen3:14b 청크당 ~250초. 대형 문서는 오래 걸림(백그라운드 배치 권장). 더 빠른 로컬 추출
+   모델은 qwen3.5:9b 시도 시 파싱 실패(작은 모델 구조화 출력 불안정) — 별도 튜닝 트랙.
+2. **글로벌 연결 질문의 잔여 약점 = 추출 recall.** 소프트한 "미팅/협의" 관계가 추출에서 누락됨(gleaning/프롬프트로 보강 여지).
+3. **M5 상위(부모) 재사용 경로는 실 E2E 미검증**(테스트 그래프가 단일 레벨) — 단위테스트로만 커버. 계층이 깊은
+   실컬렉션 생기면 육안 확인 권장.
+4. **HANDOFF-main 마일스톤 승격 + feat→main 병합**은 사용자 결정 대기(아래).
+
+### ▶️ 다음 단계
+1. (사용자 결정) 커뮤니티/글로벌층 + 무과금화를 **HANDOFF-main 마일스톤(M6~)으로 승격**할지.
+2. (사용자 결정) `feat/graphrag-full` → `main` **병합** 시점/방식.
+3. (선택) 추출 recall 보강(gleaning 기본화 검토) — 글로벌 연결 질문 품질 직결.
+
+### Handoff (인수인계)
+- **한 일:** M1~M4 실데이터 E2E 검증(로컬 ollama 전 구간 작동 확인). 로컬 추출·로컬 Q&A 무과금화(2대 결함 근본 수정).
+  글로벌 교차연결·M5 증분 재계산 추가. 커밋 4개(`1ecbb0a`·`e4bf06c`·`78cd53a`·`db63323`), pytest 261.
+- **상태:** 완료. 커뮤니티+글로벌+로컬 질의 전부 무과금(로컬)로 실동작 검증됨.
+- **다음:** HANDOFF-main 승격 + feat→main 병합(사용자 결정). 추출 recall 보강은 선택.
+- **주의·가정:** 이 머신은 Gemini 키 없음(로컬 전용). 추출 ~250초/청크. E2E 스크래치 DB는 `/tmp` 격리(비커밋).
+  [ASSUMPTION] `answer_backend`·`ingest --backend` 기본을 ollama로 둔 것은 "무과금화" 지시에 따른 것(Gemini 키
+  생기면 config로 되돌림 가능).
+
+## 📅 2026-07-20 세션 — M1.5: 엔티티 설명 통합 요약(#6, 부분→정석)
+
+### 배경
+- M1(`5f841f6`)이 만든 LLM 백엔드 라우터(`generate(..., backend="ollama")`) 위에, canonical GraphRAG의
+  "다중 언급 설명을 하나로 통합" 격차를 메운다. 지금까지는 같은 엔티티가 여러 문서에서 나오면
+  `graph_manager.upsert_entity`의 `ON MATCH SET e.description = $description`이 마지막 값으로 덮어썼다.
+
+### 변경 (✅ 구현·검증 완료 / ⏳ 커밋 대기 — 커밋은 오케스트레이터가 CEO 결재 후 별도 처리)
+- **`db/sqlite_manager.py`:** `entity_desc_candidates(collection, entity_name, source_doc, description)` 신설
+  (PK 3종 복합). CRUD 5종: `upsert_desc_candidate`/`get_desc_candidates`/`get_entities_with_min_candidates`/
+  `delete_desc_candidates_by_source_doc`/`delete_desc_candidates_by_collection`. source_doc 키로 문서 단위
+  캐스케이드 삭제가 정확히 짚히게 했다(유령 후보 방지).
+- **`db/graph_manager.py`:** `update_entity_description(collection, name, description)` 신설 — description만
+  바꾸고 type/aliases는 안 건드림(요약 배치 전용, upsert_entity와 달리 type 재전달 불필요).
+- **`pipeline/ingest.py` (`store_extraction`):** 엔티티 upsert 직후, description이 비어있지 않으면
+  `(collection, resolved_name, source_doc)` 키로 후보를 병행 적재. **hot-path 불변 확인:** description은
+  지금처럼 즉시 채워짐(로컬 질의 영향 없음), 후보 적재는 순수 DB 쓰기라 인제스트 경로에 LLM 호출 추가 없음.
+- **`pipeline/desc_summarizer.py` (신규):** `summarize_descriptions(collection, min_candidates=None,
+  backend="ollama", model=None)` — 후보 `min_candidates`(기본 `config.desc_summary_min_candidates=2`)개
+  이상인 엔티티만 도메인·언어 중립 프롬프트로 Ollama에 통합 요약 요청, 성공 시 `update_entity_description`으로
+  교체. 후보 1개는 LLM 호출 없이 스킵(호출 절약). 요약 실패/빈 응답인 엔티티는 건너뛰고 기존 설명 유지(다른
+  엔티티 처리는 안 막힘).
+- **`db/document_store.py`:** `commit_document`(재처리 시 옛 source_id 정리)·`delete_document`·
+  `delete_collection`·`cleanup_orphaned_data` 4곳에 설명 후보 캐스케이드 삭제 호출 추가(기존
+  `delete_relations_by_source_doc` 패턴과 동일한 지점). `delete_collection` 캐스케이드는 작업지시서엔 명시
+  안 됐지만, 다른 데이터(엔티티/벡터/문서)가 이미 컬렉션 통째 삭제되는 지점이라 후보만 안 지우면 이 기능이
+  스스로 유령 데이터를 만드는 셈이라 판단해 포함([ASSUMPTION] 범위 판단, 1줄 추가).
+- **`graphrag_cli.py`:** `summarize-descriptions --collection C [--min-candidates N]` 서브커맨드 신설
+  (옵트인 배치, `p_merge`/`p_bridge` 사이에 배치).
+- **`config.py`:** `desc_summary_min_candidates: int = 2` 추가(하드코딩 금지, 단일 출처).
+
+### 검증
+- `pytest -q` **193 passed**(기존 170 + 신규 23, 0 failed). 신규 테스트 분포:
+  `test_sqlite_manager.py`+6, `test_graph_manager.py`+1, `test_pipeline_ingest.py`+4(hot-path 불변 명시
+  assert 포함), `test_document_store.py`+4(캐스케이드), `test_desc_summarizer.py`+7(병합/스킵/설정 기본값/
+  실패격리/실 Ollama skipif), `test_graphrag_cli.py`+1(CLI 배선).
+- 기존 테스트 1건(`test_store_extraction_merges_known_alias_instead_of_creating_new_node`)이
+  `store_extraction`의 새 sqlite 의존성 때문에 `sqlite_manager.init_schema()` 호출이 필요해져 1줄 추가(내
+  변경이 만든 정당한 신규 의존성).
+- **실 Ollama 통합 테스트가 로컬에서 실제로 통과함**(스킵 아님 — Ollama 기동 중, qwen3:14b 응답 확인).
+- **CLI 엔드투엔드 스모크(운영 DB 미접근, `DB_DIR` 스크래치 격리):** 후보 2개("아침 회의 주재"/"오후 보고서
+  작성") 수동 적재 → `graphrag summarize-descriptions --collection 스모크테스트` 실행 →
+  `"아침에 회의를 주재한 홍길동은 오후에 보고서를 작성했다"`로 실제 통합됨을 확인. 스크래치 삭제 완료.
+
+### ⚠️ 알려진 한계(범위 밖으로 남긴 것)
+1. `entity_resolution.merge_entity_into`로 엔티티가 병합(drop)돼도 그 이름의 옛 설명 후보 행은 안 지워짐 —
+   요약 대상 조회는 canonical 이름으로만 하므로 orphan 후보는 그냥 안 쓰이고 남을 뿐(정합성 버그는 아니고
+   저장공간 낭비 수준). M1.5 범위 밖(작업지시서 "커뮤니티·글로벌·기존 Gemini 로직만 범위 밖" 명시, 이 항목은
+   언급 안 됐으나 최소 변경 원칙상 손대지 않음).
+2. `--min-candidates`를 CLI에서 안 주면 config 기본값(2) 사용 — 이 커맨드는 컬렉션당 1회성 배치라 매번 수동
+   실행(자동 트리거 없음, M1.5 스펙대로 옵트인).
+
+### ▶️ 다음 단계
+1. **커밋 대기** — 오케스트레이터가 CEO 결재 후 진행. 변경 파일 목록은 이번 세션 diff 참조(`config.py
+   db/document_store.py db/graph_manager.py db/sqlite_manager.py graphrag_cli.py pipeline/ingest.py
+   pipeline/desc_summarizer.py tests/test_document_store.py tests/test_graph_manager.py
+   tests/test_graphrag_cli.py tests/test_pipeline_ingest.py tests/test_sqlite_manager.py
+   tests/test_desc_summarizer.py HANDOFF-sub.md`).
+2. (선택) M2 착수 전, 실데이터 소규모 컬렉션으로 Ollama 통합요약 품질을 육안 확인(한국어 뉘앙스 — spec.md
+   Risk 1과 별개로 설명요약 자체의 품질 체감).
+3. M2(Leiden 계층 탐지)는 spec.md/addendum 순서대로 별도 세션.
+
 ## 📅 2026-07-02 세션 — retrieval 투자 1차: 답변 합성 충실성 재구성
 
 ### 배경

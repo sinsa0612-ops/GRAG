@@ -169,6 +169,21 @@ def test_delete_document_returns_false_when_not_found():
     assert document_store.delete_document(C, "없는파일.md") is False
 
 
+def test_delete_document_marks_communities_dirty(monkeypatch):
+    # [M2] 문서 삭제로 관계가 사라지므로 그 컬렉션의 커뮤니티는 재빌드가 필요해진다.
+    sqlite_manager.init_schema()
+    monkeypatch.setattr("db.document_store.vector_manager.delete_chunks_by_source", lambda s: None)
+    monkeypatch.setattr("db.document_store.graph_manager.delete_relations_by_source_doc", lambda s: None)
+
+    source_id = document_store.prepare_replacement("memo.md")
+    document_store.commit_document(source_id, C, "memo.md", "내용", "hash_a")
+    sqlite_manager.clear_communities_dirty(C, "이전-서명")
+
+    document_store.delete_document(C, "memo.md")
+
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+
 def test_delete_collection_removes_everything(monkeypatch):
     # 컬렉션 통째 삭제: 문서 기록 + 벡터 청크 + 그래프 엔티티/관계가 그 컬렉션만 사라져야 한다.
     sqlite_manager.init_schema()
@@ -190,6 +205,46 @@ def test_delete_collection_removes_everything(monkeypatch):
     assert sqlite_manager.count_documents(["사업A"]) == 0
     assert graph_manager.count_entities(["사업A"]) == 0
     assert graph_manager.count_entities(["사업B"]) == 1
+
+
+def test_delete_collection_cascades_communities_and_build_state():
+    # [M2] 컬렉션을 통째로 지우면 그 컬렉션의 커뮤니티 오버레이(탐지 결과 + dirty/서명 상태)도 함께 사라져야
+    # 한다 — 삭제된 컬렉션의 유령 커뮤니티 행이 남으면 안 된다(다른 컬렉션은 그대로).
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    community = {
+        "collection": "사업A",
+        "community_id": "c1",
+        "level": 0,
+        "parent_community_id": None,
+        "entity_names": ["김부장"],
+        "size": 1,
+        "graph_signature": "sig",
+    }
+    sqlite_manager.replace_communities("사업A", [community])
+    sqlite_manager.clear_communities_dirty("사업A", "sig")
+    sqlite_manager.replace_communities("사업B", [{**community, "collection": "사업B"}])
+    sqlite_manager.clear_communities_dirty("사업B", "sig")
+
+    document_store.delete_collection("사업A")
+
+    assert sqlite_manager.get_communities("사업A") == []
+    assert sqlite_manager.is_communities_dirty("사업A") is True  # 상태 행도 삭제돼 기본값(dirty)으로
+    assert len(sqlite_manager.get_communities("사업B")) == 1
+    assert sqlite_manager.is_communities_dirty("사업B") is False
+
+
+def test_delete_collection_cascades_community_reports():
+    # [M3] 컬렉션을 통째로 지우면 그 컬렉션의 커뮤니티 리포트도 함께 사라져야 한다(다른 컬렉션은 그대로).
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    sqlite_manager.upsert_community_report("사업A", "c1", 0, "A제목", "A요약", None)
+    sqlite_manager.upsert_community_report("사업B", "c1", 0, "B제목", "B요약", None)
+
+    document_store.delete_collection("사업A")
+
+    assert sqlite_manager.get_community_reports("사업A") == []
+    assert len(sqlite_manager.get_community_reports("사업B")) == 1
 
 
 def test_find_orphaned_source_ids_detects_untracked_data():
@@ -234,3 +289,72 @@ def test_cleanup_orphaned_data_removes_untracked_relations():
 
     assert removed == 1
     assert graph_manager.get_outgoing_relations(C, "A") == []
+
+
+# --- M1.5: 설명 후보(entity_desc_candidates) 캐스케이드 — 유령 후보 방지(spec-addendum §C-4) ---
+
+
+def test_commit_document_cleans_up_old_desc_candidates(monkeypatch):
+    # 문서 재처리 시 옛 source_id가 남긴 설명 후보는 정확히 제거되고, 새 문서 후보만 남아야 한다.
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr(
+        "db.document_store.vector_manager.delete_chunks_by_source", lambda source_id: None
+    )
+
+    first_id = document_store.prepare_replacement("memo.md")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", first_id, "첫 버전 설명")
+    document_store.commit_document(first_id, C, "memo.md", "첫 버전", "hash_a")
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["첫 버전 설명"]
+
+    second_id = document_store.prepare_replacement("memo.md")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", second_id, "둘째 버전 설명")
+    document_store.commit_document(second_id, C, "memo.md", "둘째 버전", "hash_b")
+
+    # 옛 문서(first_id) 후보는 사라지고 새 문서(second_id) 후보만 남아야 한다(유령 후보 없음).
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["둘째 버전 설명"]
+
+
+def test_delete_document_removes_desc_candidates(monkeypatch):
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr(
+        "db.document_store.vector_manager.delete_chunks_by_source", lambda source_id: None
+    )
+    source_id = document_store.prepare_replacement("memo.md")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", source_id, "설명")
+    document_store.commit_document(source_id, C, "memo.md", "내용", "hash_a")
+
+    document_store.delete_document(C, "memo.md")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == []
+
+
+def test_delete_collection_removes_desc_candidates_scoped_to_that_collection(monkeypatch):
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr("db.document_store.vector_manager.delete_chunks_by_collection", lambda c: None)
+
+    sqlite_manager.upsert_document("doc_a", "사업A", "memo.md", "내용", "h")
+    sqlite_manager.upsert_desc_candidate("사업A", "김부장", "doc_a", "A쪽 설명")
+    sqlite_manager.upsert_desc_candidate("사업B", "이대리", "doc_b", "B쪽 설명")
+
+    document_store.delete_collection("사업A")
+
+    assert sqlite_manager.get_desc_candidates("사업A", "김부장") == []
+    assert sqlite_manager.get_desc_candidates("사업B", "이대리") == ["B쪽 설명"]
+
+
+def test_cleanup_orphaned_data_removes_orphaned_desc_candidates():
+    # 처리 중간에 끊겨 문서 기록이 없는 source_id의 설명 후보도 고아 정리 대상이어야 한다.
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    graph_manager.upsert_entity(C, "A", "Person", "")
+    graph_manager.upsert_entity(C, "B", "Person", "")
+    graph_manager.upsert_relation(C, "A", "B", "KNOWS", "", "doc_orphan")
+    sqlite_manager.upsert_desc_candidate(C, "A", "doc_orphan", "고아 설명")
+
+    removed = document_store.cleanup_orphaned_data()
+
+    assert removed == 1
+    assert sqlite_manager.get_desc_candidates(C, "A") == []

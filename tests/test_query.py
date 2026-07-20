@@ -105,7 +105,7 @@ def test_answer_question_uses_configured_top_k_and_bridges_chunk_entities(monkey
     monkeypatch.setattr("query.vector_manager.query_similar", fake_query_similar)
 
     captured_prompts = []
-    monkeypatch.setattr(query, "generate", lambda prompt: captured_prompts.append(prompt) or "답변")
+    monkeypatch.setattr(query, "generate", lambda prompt, **kwargs: captured_prompts.append(prompt) or "답변")
 
     result = query.answer_question("이 사람은 무슨 일을 하나?")  # 질문에 엔티티 이름이 직접 없음
 
@@ -126,7 +126,7 @@ def test_answer_question_uses_only_provided_context(monkeypatch):
 
     captured_prompts = []
 
-    def capturing_generate(prompt):
+    def capturing_generate(prompt, **kwargs):
         captured_prompts.append(prompt)
         return "답변"
 
@@ -162,7 +162,7 @@ def test_answer_prompt_frames_vector_as_primary(monkeypatch):
         lambda q, top_k=8, collections=None: ["조각내용"],
     )
     captured = []
-    monkeypatch.setattr(query, "generate", lambda prompt: captured.append(prompt) or "답")
+    monkeypatch.setattr(query, "generate", lambda prompt, **kwargs: captured.append(prompt) or "답")
 
     query.answer_question("질문?")
 
@@ -170,3 +170,39 @@ def test_answer_prompt_frames_vector_as_primary(monkeypatch):
     assert "[본문 조각]" in prompt and "[그래프 힌트]" in prompt
     assert "본문과 어긋나면" in prompt  # 충돌 시 본문 우선 원칙 명시
     assert prompt.index("[본문 조각]") < prompt.index("[그래프 힌트]")  # 본문이 1차(먼저)
+
+
+def test_answer_question_forwards_backend_and_skips_rpd_for_ollama(monkeypatch):
+    # 무과금화: backend를 generate로 전달하고, 비-Gemini(ollama)면 RPD 사용량을 기록하지 않는다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    monkeypatch.setattr(
+        "query.vector_manager.query_similar", lambda q, top_k=8, collections=None: ["조각"]
+    )
+    seen = {}
+    monkeypatch.setattr(query, "generate", lambda prompt, **kwargs: seen.update(backend=kwargs.get("backend")) or "답")
+    usage = {"n": 0}
+    monkeypatch.setattr(query.sqlite_manager, "record_api_usage", lambda n: usage.__setitem__("n", usage["n"] + 1))
+
+    query.answer_question("질문?", backend="ollama")
+    assert seen["backend"] == "ollama"
+    assert usage["n"] == 0  # ollama = RPD 무관, 기록 안 함
+
+    query.answer_question("질문?", backend="gemini")
+    assert seen["backend"] == "gemini"
+    assert usage["n"] == 1  # gemini만 RPD 기록
+
+
+def test_answer_question_backend_defaults_to_config(monkeypatch):
+    # backend 미지정이면 설정값(settings.answer_backend)을 쓴다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    monkeypatch.setattr(settings, "answer_backend", "ollama")
+    monkeypatch.setattr(
+        "query.vector_manager.query_similar", lambda q, top_k=8, collections=None: ["조각"]
+    )
+    seen = {}
+    monkeypatch.setattr(query, "generate", lambda prompt, **kwargs: seen.update(backend=kwargs.get("backend")) or "답")
+
+    query.answer_question("질문?")
+    assert seen["backend"] == "ollama"
