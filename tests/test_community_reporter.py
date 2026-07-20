@@ -37,6 +37,19 @@ def test_build_leaf_prompt_handles_no_relations():
 
     assert "A" in prompt
     assert "(관계 없음)" in prompt
+    assert "(바깥으로 이어지는 관계 없음)" in prompt  # 외부 연결 미지정 시 안내
+
+
+def test_build_leaf_prompt_includes_external_links():
+    # 커뮤니티 경계를 넘는 관계(외부 연결)가 프롬프트에 담겨야 글로벌 검색이 그룹 간 연결을 답할 수 있다.
+    entities = [{"name": "A", "description": "내부"}]
+    internal = [{"source": "A", "target": "A", "predicate": "SELF"}]
+    external = [{"source": "A", "target": "Z(외부그룹)", "predicate": "MEETS"}]
+
+    prompt = community_reporter._build_leaf_prompt(entities, internal, external)
+
+    assert "Z(외부그룹)" in prompt and "MEETS" in prompt
+    assert "다른 그룹으로 이어지는 관계" in prompt
 
 
 def test_build_parent_prompt_includes_child_titles_and_summaries():

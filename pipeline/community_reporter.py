@@ -30,6 +30,11 @@ _LEAF_PROMPT = """\
 관계들:
 {relations}
 
+이 커뮤니티가 바깥 항목과 맺는 연결(다른 그룹으로 이어지는 관계):
+{external_links}
+
+summary에는 이 커뮤니티의 핵심 내용을 담되, 위 '바깥 항목과 맺는 연결'이 있으면 이 커뮤니티가
+다른 그룹과 어떻게 이어지는지도 함께 밝혀줘(없으면 생략).
 다음 JSON 형식으로만 응답해줘(다른 설명이나 머리말 없이 순수 JSON만):
 {{"title": "이 커뮤니티를 대표하는 짧은 제목", "summary": "핵심 내용을 종합한 문단", "rating": 0에서 10 사이 숫자(이 커뮤니티가 얼마나 중요/핵심적인지)}}
 """
@@ -46,8 +51,12 @@ _PARENT_PROMPT = """\
 """
 
 
-# 리프 커뮤니티 프롬프트를 만든다 — 멤버 엔티티(이름+설명)와 그 사이 관계를 번호 없는 목록으로 넣는다.
-def _build_leaf_prompt(entities: list[dict], relations: list[dict]) -> str:
+# 리프 커뮤니티 프롬프트를 만든다 — 멤버 엔티티(이름+설명)와 그 사이 내부 관계, 그리고 커뮤니티 경계를
+# 넘는 외부 연결(다른 커뮤니티로 이어지는 관계)을 각각 번호 없는 목록으로 넣는다. 외부 연결이 있어야
+# 글로벌 검색이 "그룹 간 연결" 질문에 답할 수 있다(리프 리포트에 교차 엣지가 담기므로).
+def _build_leaf_prompt(
+    entities: list[dict], relations: list[dict], external_relations: list[dict] | None = None
+) -> str:
     members = "\n".join(f"- {e['name']}: {e.get('description') or '(설명 없음)'}" for e in entities)
     if relations:
         rel_lines = "\n".join(
@@ -55,7 +64,15 @@ def _build_leaf_prompt(entities: list[dict], relations: list[dict]) -> str:
         )
     else:
         rel_lines = "(관계 없음)"
-    return _LEAF_PROMPT.format(members=members or "(항목 없음)", relations=rel_lines)
+    if external_relations:
+        ext_lines = "\n".join(
+            f"- {r['source']} -[{r['predicate']}]-> {r['target']}" for r in external_relations
+        )
+    else:
+        ext_lines = "(바깥으로 이어지는 관계 없음)"
+    return _LEAF_PROMPT.format(
+        members=members or "(항목 없음)", relations=rel_lines, external_links=ext_lines
+    )
 
 
 # 상위 레벨 커뮤니티 프롬프트를 만든다 — 이미 생성된 자식 커뮤니티 리포트(title+summary)를 재료로 넣는다.
@@ -134,7 +151,13 @@ def generate_reports(collection: str, model: str | None = None) -> int:
             member_relations = [
                 r for r in relations if r["source"] in member_names and r["target"] in member_names
             ]
-            prompt = _build_leaf_prompt(members, member_relations)
+            # 경계를 넘는 관계(정확히 한 끝만 이 커뮤니티 멤버) = 다른 그룹으로 이어지는 외부 연결.
+            # 이걸 리포트에 담아야 글로벌 검색이 "그룹 간 연결" 질문에 답할 수 있다(상한으로 프롬프트 폭주 방지).
+            external_relations = [
+                r for r in relations
+                if (r["source"] in member_names) != (r["target"] in member_names)
+            ][: settings.community_report_external_max]
+            prompt = _build_leaf_prompt(members, member_relations, external_relations)
 
         backend = _backend_for_level(level)
         try:
