@@ -156,6 +156,7 @@ def delete_document(collection: str, file_name: str) -> bool:
     graph_manager.delete_relations_by_source_doc(source_id)
     sqlite_manager.delete_desc_candidates_by_source_doc(source_id)  # [M1.5] 유령 설명 후보 방지
     sqlite_manager.delete_document(collection, file_name)
+    sqlite_manager.mark_communities_dirty(collection)  # [M2] 관계가 사라졌으니 커뮤니티 재빌드 필요
     logger.info("문서 완전 삭제: [%s] %s (source_id=%s)", collection, file_name, source_id)
     return True
 
@@ -168,6 +169,8 @@ def delete_collection(collection: str) -> int:
     graph_manager.delete_collection(collection)
     sqlite_manager.delete_collection_documents(collection)
     sqlite_manager.delete_desc_candidates_by_collection(collection)  # [M1.5] 유령 설명 후보 방지
+    sqlite_manager.delete_communities_by_collection(collection)  # [M2] 커뮤니티 오버레이도 함께 삭제
+    sqlite_manager.delete_community_build_state(collection)  # [M2] dirty/서명 상태도 함께 삭제
     logger.info("컬렉션 통째 삭제: %s (문서 %d개)", collection, doc_count)
     return doc_count
 

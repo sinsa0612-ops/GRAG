@@ -208,6 +208,59 @@ def test_cli_summarize_descriptions_dispatches_to_pipeline(tmp_path, monkeypatch
     assert "3개" in capsys.readouterr().out
 
 
+def test_cli_communities_build_populates_sqlite(tmp_path, monkeypatch, capsys):
+    # LLM 없이(순수 CPU) 그래프를 직접 심고, communities build가 SQLite를 채우고 dirty를 해제하는지 확인한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import graph_manager, sqlite_manager
+
+    graphrag_cli.main(["init"])
+    for name in ["A", "B", "C"]:
+        graph_manager.upsert_entity("사업A", name, "OTHER", "")
+    graph_manager.upsert_relation("사업A", "A", "B", "RELATED_TO", "", "doc1")
+    graph_manager.upsert_relation("사업A", "B", "C", "RELATED_TO", "", "doc1")
+    assert sqlite_manager.is_communities_dirty("사업A") is True
+
+    graphrag_cli.main(["communities", "build", "--collection", "사업A"])
+
+    stored = sqlite_manager.get_communities("사업A")
+    assert stored
+    assert all(c["collection"] == "사업A" for c in stored)
+    assert sqlite_manager.is_communities_dirty("사업A") is False
+    assert "저장 완료" in capsys.readouterr().out
+
+
+def test_cli_communities_build_on_empty_collection_stores_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import sqlite_manager
+
+    graphrag_cli.main(["init"])
+
+    graphrag_cli.main(["communities", "build", "--collection", "빈사업"])
+
+    assert sqlite_manager.get_communities("빈사업") == []
+    assert "엔티티가 없어" in capsys.readouterr().out
+
+
+# [M2 회귀] cmd_delete는 문서 삭제가 no-op이어도, cleanup이 기존 고립 엔티티를 지우면(=그래프 변이)
+# 해당 컬렉션을 dirty로 표시해야 한다. 안 그러면 삭제된 엔티티가 낡은 커뮤니티 멤버로 남는다.
+def test_cli_delete_marks_dirty_when_cleanup_removes_isolated(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from db import graph_manager, sqlite_manager
+    from pipeline import community_detector
+
+    graphrag_cli.main(["init"])
+    graph_manager.upsert_entity("사업A", "외톨이", "OTHER", "")  # 관계 없는 고립 엔티티
+    comms, sig = community_detector.detect_communities("사업A")
+    sqlite_manager.replace_communities("사업A", comms)
+    sqlite_manager.clear_communities_dirty("사업A", sig)
+    assert sqlite_manager.is_communities_dirty("사업A") is False
+
+    # 존재하지 않는 파일 삭제 → delete_document는 dirty를 세우지 않지만 cleanup이 외톨이를 지운다
+    graphrag_cli.main(["delete", "없는파일.md", "--collection", "사업A"])
+
+    assert sqlite_manager.is_communities_dirty("사업A") is True
+
+
 def test_cli_bridge_add_and_list(tmp_path, monkeypatch, capsys):
     # bridge add로 사업 간 같은 대상을 연결하고 bridge list에 보이는지 확인한다.
     monkeypatch.setattr(settings, "project_root", tmp_path)

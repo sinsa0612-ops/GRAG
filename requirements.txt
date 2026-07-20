@@ -10,5 +10,8 @@ pydantic-settings==2.14.2
 pytest==9.1.1
 streamlit==1.58.0
 pyvis==0.3.2
+# 커뮤니티 탐지(M2) — Leiden 알고리즘 원저자 레퍼런스 구현. 순수 CPU, LLM 호출 없음.
+python-igraph==1.0.0
+leidenalg==0.12.0
 # Windows엔 IANA 타임존 DB가 없어, 사용량 집계를 태평양시간(Gemini 한도 리셋) 기준으로 맞추는 데 필요.
 tzdata==2026.2

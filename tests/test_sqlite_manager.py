@@ -198,3 +198,122 @@ def test_delete_desc_candidates_by_collection_scoped():
 
     assert sqlite_manager.get_desc_candidates("사업A", "김변호사") == []
     assert sqlite_manager.get_desc_candidates("사업B", "김변호사") == ["B쪽 설명"]
+
+
+# --- M2: communities(커뮤니티 탐지 결과) ---
+
+
+def _sample_communities(collection: str) -> list[dict]:
+    return [
+        {
+            "collection": collection,
+            "community_id": "root1",
+            "level": 0,
+            "parent_community_id": None,
+            "entity_names": ["A", "B", "C"],
+            "size": 3,
+            "graph_signature": "sig1",
+        },
+        {
+            "collection": collection,
+            "community_id": "child1",
+            "level": 1,
+            "parent_community_id": "root1",
+            "entity_names": ["A", "B"],
+            "size": 2,
+            "graph_signature": "sig1",
+        },
+    ]
+
+
+def test_replace_communities_stores_and_retrieves():
+    sqlite_manager.init_schema()
+    assert sqlite_manager.get_communities(C) == []
+
+    sqlite_manager.replace_communities(C, _sample_communities(C))
+
+    stored = sqlite_manager.get_communities(C)
+    assert len(stored) == 2
+    root = next(c for c in stored if c["community_id"] == "root1")
+    assert root == {
+        "collection": C,
+        "community_id": "root1",
+        "level": 0,
+        "parent_community_id": None,
+        "entity_names": ["A", "B", "C"],
+        "size": 3,
+        "graph_signature": "sig1",
+    }
+
+
+def test_get_communities_filters_by_level():
+    sqlite_manager.init_schema()
+    sqlite_manager.replace_communities(C, _sample_communities(C))
+
+    level0 = sqlite_manager.get_communities(C, level=0)
+    level1 = sqlite_manager.get_communities(C, level=1)
+
+    assert [c["community_id"] for c in level0] == ["root1"]
+    assert [c["community_id"] for c in level1] == ["child1"]
+
+
+def test_replace_communities_overwrites_stale_rows():
+    # 재탐지 결과로 통째로 교체돼야 한다 — 옛 커뮤니티(멤버가 바뀌어 사라진 것)가 유령으로 남으면 안 된다.
+    sqlite_manager.init_schema()
+    sqlite_manager.replace_communities(C, _sample_communities(C))
+
+    new_communities = [
+        {
+            "collection": C,
+            "community_id": "fresh1",
+            "level": 0,
+            "parent_community_id": None,
+            "entity_names": ["X"],
+            "size": 1,
+            "graph_signature": "sig2",
+        }
+    ]
+    sqlite_manager.replace_communities(C, new_communities)
+
+    stored = sqlite_manager.get_communities(C)
+    assert [c["community_id"] for c in stored] == ["fresh1"]
+
+
+def test_communities_are_collection_scoped():
+    sqlite_manager.init_schema()
+    sqlite_manager.replace_communities("사업A", _sample_communities("사업A"))
+    sqlite_manager.replace_communities("사업B", _sample_communities("사업B"))
+
+    sqlite_manager.delete_communities_by_collection("사업A")
+
+    assert sqlite_manager.get_communities("사업A") == []
+    assert len(sqlite_manager.get_communities("사업B")) == 2
+
+
+def test_communities_dirty_flag_defaults_true_when_never_built():
+    sqlite_manager.init_schema()
+    # 한 번도 빌드된 적 없는 컬렉션은 상태 행 자체가 없어도 '빌드 필요'로 간주해야 한다.
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+
+def test_mark_and_clear_communities_dirty_roundtrip():
+    sqlite_manager.init_schema()
+    sqlite_manager.mark_communities_dirty(C)
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+    sqlite_manager.clear_communities_dirty(C, "sig-abc")
+    assert sqlite_manager.is_communities_dirty(C) is False
+
+    # 다시 그래프가 바뀌면 dirty로 되돌아간다.
+    sqlite_manager.mark_communities_dirty(C)
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+
+def test_delete_community_build_state_resets_to_dirty_by_default():
+    sqlite_manager.init_schema()
+    sqlite_manager.clear_communities_dirty(C, "sig-abc")
+    assert sqlite_manager.is_communities_dirty(C) is False
+
+    sqlite_manager.delete_community_build_state(C)
+
+    assert sqlite_manager.is_communities_dirty(C) is True

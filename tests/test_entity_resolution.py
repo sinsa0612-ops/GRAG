@@ -87,6 +87,24 @@ def test_run_skips_backup_when_no_candidates(monkeypatch):
     assert backup_calls == []
 
 
+def test_run_marks_communities_dirty_only_when_merge_happens(monkeypatch):
+    # [M2] 수동 병합(정규화/임베딩 둘 다)과 blacklist 해제 후 재병합은 모두 이 run()을 거치므로,
+    # 실제로 병합이 일어난 컬렉션만 dirty로 표시되고 아무것도 안 바뀐 컬렉션은 건드리지 않아야 한다.
+    monkeypatch.setattr(entity_resolution, "embed_texts", _fake_embed_texts)
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    graph_manager.upsert_entity("사업A", "애플", "Asset", "스마트폰 제조사")
+    graph_manager.upsert_entity("사업A", "Apple", "Asset", "스마트폰 제조사 기업")
+    graph_manager.upsert_entity("사업B", "고양이", "Animal", "동물")  # 병합 후보 없음
+    sqlite_manager.clear_communities_dirty("사업A", "이전-서명")
+    sqlite_manager.clear_communities_dirty("사업B", "이전-서명")
+
+    entity_resolution.run()
+
+    assert sqlite_manager.is_communities_dirty("사업A") is True
+    assert sqlite_manager.is_communities_dirty("사업B") is False
+
+
 def test_merge_only_happens_within_a_collection(monkeypatch):
     # 다른 컬렉션의 비슷한 엔티티는 자동 병합되지 않아야 한다(사업 간 격벽).
     monkeypatch.setattr(entity_resolution, "embed_texts", _fake_embed_texts)

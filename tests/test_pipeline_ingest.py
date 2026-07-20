@@ -31,6 +31,25 @@ def test_process_file_extracts_and_stores(tmp_path, monkeypatch):
     assert "강택리" in names
 
 
+def test_process_file_marks_collection_communities_dirty(tmp_path, monkeypatch):
+    # [M2] 인제스트는 값싼 기본 경로를 유지하면서도(LLM 커뮤니티 작업 0), 해당 컬렉션을
+    # '커뮤니티 재빌드 필요'로만 표시해야 한다(addendum §C-3 — 그래프 변이 계층에서의 dirty 마킹).
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert sqlite_manager.is_communities_dirty(C) is True  # 아직 빌드된 적 없음 — 기본이 dirty
+    sqlite_manager.clear_communities_dirty(C, "이전-서명")  # 방금 빌드해서 깨끗해졌다고 가정
+
+    assert ingest.process_file(file_path, C) is True
+
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+
 def test_process_file_skips_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
     monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)

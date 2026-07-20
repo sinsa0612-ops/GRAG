@@ -186,7 +186,7 @@ def cmd_usage(args) -> None:
 # 문서를 컬렉션에서 삭제한다(벡터 청크 + 관계 + 문서 기록). 그로 인해 고립된 엔티티도 정리한다.
 # 잘못된 컬렉션으로 추출했을 때 되돌리는 용도. 단, 다른 엔티티와 연결된 채 남은 노드는 자동 삭제되지 않는다.
 def cmd_delete(args) -> None:
-    from db import document_store, graph_manager
+    from db import document_store, graph_manager, sqlite_manager
 
     collection = args.collection or settings.default_collection
     for f in args.files:
@@ -194,6 +194,10 @@ def cmd_delete(args) -> None:
         ok = document_store.delete_document(collection, name)
         print(f"[{collection}] {name}: {'삭제됨' if ok else '문서를 찾을 수 없음'}")
     removed = graph_manager.cleanup_isolated_entities([collection])
+    # [M2] 고립 엔티티 정리는 그래프 변이(엔티티 삭제)다 — delete_document가 이미 dirty를 세우지만,
+    # 문서 삭제가 없었어도(no-op) cleanup이 기존 고립 엔티티를 지우면 커뮤니티 멤버십이 바뀌므로 여기서도 표시한다.
+    if removed:
+        sqlite_manager.mark_communities_dirty(collection)
     print(f"고립된 엔티티 {removed}개 정리됨")
 
 
@@ -292,6 +296,25 @@ def cmd_summarize_descriptions(args) -> None:
 
     updated = desc_summarizer.summarize_descriptions(args.collection, min_candidates=args.min_candidates)
     print(f"[{args.collection}] 설명 통합 완료: {updated}개 엔티티")
+
+
+# 커뮤니티 탐지(Leiden, 컬렉션별)를 실행해 SQLite에 저장한다(M2 — 탐지만, 요약 리포트는 M3).
+# 순수 CPU 연산이라 LLM 호출이 전혀 없다. 빌드가 끝까지 완주했을 때만 dirty를 해제한다(크래시 안전).
+def cmd_communities(args) -> None:
+    from db import sqlite_manager
+    from pipeline import community_detector
+
+    if args.action == "build":
+        collection = args.collection
+        print(f"[{collection}] 커뮤니티 탐지 중(Leiden, 순수 CPU)...")
+        communities, graph_signature = community_detector.detect_communities(collection)
+        sqlite_manager.replace_communities(collection, communities)
+        sqlite_manager.clear_communities_dirty(collection, graph_signature)
+        if communities:
+            levels = sorted({c["level"] for c in communities})
+            print(f"[{collection}] 커뮤니티 {len(communities)}개 저장 완료 (레벨 {levels})")
+        else:
+            print(f"[{collection}] 엔티티가 없어 커뮤니티가 생성되지 않았습니다.")
 
 
 # "컬렉션:이름" 형식 인자를 (컬렉션, 이름)으로 가른다. 형식이 틀리면 None.
@@ -485,6 +508,13 @@ def main(argv: list[str] | None = None) -> None:
         help="통합 요약을 트리거할 최소 후보 수(기본: 설정값)",
     )
     p_summarize.set_defaults(func=cmd_summarize_descriptions)
+
+    p_communities = sub.add_parser(
+        "communities", help="커뮤니티 탐지(Leiden, 컬렉션별) — 리포트/글로벌검색은 이후 마일스톤"
+    )
+    p_communities.add_argument("action", choices=["build"], help="동작(현재는 build만)")
+    p_communities.add_argument("--collection", required=True, help="대상 컬렉션(사업) 이름")
+    p_communities.set_defaults(func=cmd_communities)
 
     p_bridge = sub.add_parser("bridge", help="컬렉션 간 같은 대상 연결(SAME_AS 브릿지)")
     p_bridge.add_argument("action", choices=["add", "remove", "list", "suggest"], help="동작")

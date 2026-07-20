@@ -300,5 +300,7 @@ def process_file(
     if extra_calls:
         sqlite_manager.record_api_usage(extra_calls)  # gleaning으로 추가 소비한 호출 기록
     document_store.commit_document(source_id, collection, file_name, content, content_hash)
+    # [M2] 그래프가 바뀌었으니 이 컬렉션의 커뮤니티는 재빌드가 필요하다(LLM 없이 플래그만 세팅 — 값싼 인제스트 경로 불변).
+    sqlite_manager.mark_communities_dirty(collection)
     logger.info("[%s] %s 처리 완료 (source_id=%s, 청크 %d개)", collection, file_name, source_id, len(chunks))
     return True

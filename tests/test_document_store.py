@@ -169,6 +169,21 @@ def test_delete_document_returns_false_when_not_found():
     assert document_store.delete_document(C, "없는파일.md") is False
 
 
+def test_delete_document_marks_communities_dirty(monkeypatch):
+    # [M2] 문서 삭제로 관계가 사라지므로 그 컬렉션의 커뮤니티는 재빌드가 필요해진다.
+    sqlite_manager.init_schema()
+    monkeypatch.setattr("db.document_store.vector_manager.delete_chunks_by_source", lambda s: None)
+    monkeypatch.setattr("db.document_store.graph_manager.delete_relations_by_source_doc", lambda s: None)
+
+    source_id = document_store.prepare_replacement("memo.md")
+    document_store.commit_document(source_id, C, "memo.md", "내용", "hash_a")
+    sqlite_manager.clear_communities_dirty(C, "이전-서명")
+
+    document_store.delete_document(C, "memo.md")
+
+    assert sqlite_manager.is_communities_dirty(C) is True
+
+
 def test_delete_collection_removes_everything(monkeypatch):
     # 컬렉션 통째 삭제: 문서 기록 + 벡터 청크 + 그래프 엔티티/관계가 그 컬렉션만 사라져야 한다.
     sqlite_manager.init_schema()
@@ -190,6 +205,33 @@ def test_delete_collection_removes_everything(monkeypatch):
     assert sqlite_manager.count_documents(["사업A"]) == 0
     assert graph_manager.count_entities(["사업A"]) == 0
     assert graph_manager.count_entities(["사업B"]) == 1
+
+
+def test_delete_collection_cascades_communities_and_build_state():
+    # [M2] 컬렉션을 통째로 지우면 그 컬렉션의 커뮤니티 오버레이(탐지 결과 + dirty/서명 상태)도 함께 사라져야
+    # 한다 — 삭제된 컬렉션의 유령 커뮤니티 행이 남으면 안 된다(다른 컬렉션은 그대로).
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    community = {
+        "collection": "사업A",
+        "community_id": "c1",
+        "level": 0,
+        "parent_community_id": None,
+        "entity_names": ["김부장"],
+        "size": 1,
+        "graph_signature": "sig",
+    }
+    sqlite_manager.replace_communities("사업A", [community])
+    sqlite_manager.clear_communities_dirty("사업A", "sig")
+    sqlite_manager.replace_communities("사업B", [{**community, "collection": "사업B"}])
+    sqlite_manager.clear_communities_dirty("사업B", "sig")
+
+    document_store.delete_collection("사업A")
+
+    assert sqlite_manager.get_communities("사업A") == []
+    assert sqlite_manager.is_communities_dirty("사업A") is True  # 상태 행도 삭제돼 기본값(dirty)으로
+    assert len(sqlite_manager.get_communities("사업B")) == 1
+    assert sqlite_manager.is_communities_dirty("사업B") is False
 
 
 def test_find_orphaned_source_ids_detects_untracked_data():

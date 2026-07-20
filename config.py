@@ -70,6 +70,14 @@ class Settings(BaseSettings):
     # 엔티티 설명 후보가 이 개수 이상 쌓여야 통합 요약을 트리거한다(후보 1개는 통합할 게 없어 스킵, 호출 절약).
     desc_summary_min_candidates: int = 2
 
+    # --- 커뮤니티 탐지(M2, igraph+leidenalg) 설정 — 순수 CPU, LLM 호출 없음 ---
+    # Leiden 알고리즘 난수 시드. 고정해야 같은 그래프에서 재탐지해도 같은 커뮤니티가 나온다(테스트 재현성).
+    leiden_seed: int = 42
+    # 커뮤니티 크기가 이 값을 넘으면 그 유도 서브그래프에 Leiden을 한 번 더 돌려 하위 레벨로 쪼갠다.
+    community_max_size: int = 30
+    # 계층 재귀가 내려갈 수 있는 최대 레벨(0=최상위). 무한 재귀를 막는 안전판이기도 하다.
+    community_max_level: int = 3
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:
