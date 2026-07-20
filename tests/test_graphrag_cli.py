@@ -184,6 +184,30 @@ def test_cli_set_parent_expands_status_scope(tmp_path, monkeypatch, capsys):
     assert "엔티티 수: 1" in capsys.readouterr().out
 
 
+def test_cli_summarize_descriptions_dispatches_to_pipeline(tmp_path, monkeypatch, capsys):
+    # CLI가 인자를 그대로 파이프라인 함수에 넘기고, 반환된 개수를 출력하는지 확인한다(요약 로직 자체는
+    # tests/test_desc_summarizer.py가 검증 — 여기는 배선만 확인).
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    from pipeline import desc_summarizer
+
+    captured = {}
+
+    def fake_summarize(collection, min_candidates=None):
+        captured["collection"] = collection
+        captured["min_candidates"] = min_candidates
+        return 3
+
+    monkeypatch.setattr(desc_summarizer, "summarize_descriptions", fake_summarize)
+
+    graphrag_cli.main(["init"])
+    graphrag_cli.main(
+        ["summarize-descriptions", "--collection", "사업A", "--min-candidates", "5"]
+    )
+
+    assert captured == {"collection": "사업A", "min_candidates": 5}
+    assert "3개" in capsys.readouterr().out
+
+
 def test_cli_bridge_add_and_list(tmp_path, monkeypatch, capsys):
     # bridge add로 사업 간 같은 대상을 연결하고 bridge list에 보이는지 확인한다.
     monkeypatch.setattr(settings, "project_root", tmp_path)

@@ -136,3 +136,65 @@ def test_list_and_remove_merge_blacklist():
     sqlite_manager.remove_merge_blacklist(C, "Apple", "애플")
     assert sqlite_manager.list_merge_blacklist() == []
     assert sqlite_manager.is_merge_blacklisted(C, "애플", "Apple") is False
+
+
+# --- M1.5: 엔티티 설명 후보(entity_desc_candidates) ---
+
+
+def test_upsert_and_get_desc_candidates():
+    sqlite_manager.init_schema()
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == []
+
+    sqlite_manager.upsert_desc_candidate(C, "강택리", "doc_a", "기획자")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", "doc_b", "ISA계좌 운영자")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["기획자", "ISA계좌 운영자"]
+
+
+def test_upsert_desc_candidate_same_doc_replaces_not_accumulates():
+    # 같은 문서가 같은 엔티티를 다시 언급하면(같은 문서 안 다른 청크) 그 문서 몫 1행만 최신으로 갱신돼야 한다.
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_desc_candidate(C, "강택리", "doc_a", "1차 설명")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", "doc_a", "2차(갱신) 설명")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["2차(갱신) 설명"]
+
+
+def test_desc_candidates_are_collection_scoped():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_desc_candidate("사업A", "김변호사", "doc_a", "A쪽 설명")
+    sqlite_manager.upsert_desc_candidate("사업B", "김변호사", "doc_b", "B쪽 설명")
+
+    assert sqlite_manager.get_desc_candidates("사업A", "김변호사") == ["A쪽 설명"]
+    assert sqlite_manager.get_desc_candidates("사업B", "김변호사") == ["B쪽 설명"]
+
+
+def test_get_entities_with_min_candidates():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_desc_candidate(C, "다중후보", "doc_a", "설명1")
+    sqlite_manager.upsert_desc_candidate(C, "다중후보", "doc_b", "설명2")
+    sqlite_manager.upsert_desc_candidate(C, "단일후보", "doc_c", "설명3")
+
+    assert sqlite_manager.get_entities_with_min_candidates(C, 2) == ["다중후보"]
+    assert set(sqlite_manager.get_entities_with_min_candidates(C, 1)) == {"다중후보", "단일후보"}
+
+
+def test_delete_desc_candidates_by_source_doc_removes_only_that_doc():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_desc_candidate(C, "강택리", "doc_a", "옛 문서 설명")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", "doc_b", "새 문서 설명")
+
+    sqlite_manager.delete_desc_candidates_by_source_doc("doc_a")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["새 문서 설명"]
+
+
+def test_delete_desc_candidates_by_collection_scoped():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_desc_candidate("사업A", "김변호사", "doc_a", "A쪽 설명")
+    sqlite_manager.upsert_desc_candidate("사업B", "김변호사", "doc_b", "B쪽 설명")
+
+    sqlite_manager.delete_desc_candidates_by_collection("사업A")
+
+    assert sqlite_manager.get_desc_candidates("사업A", "김변호사") == []
+    assert sqlite_manager.get_desc_candidates("사업B", "김변호사") == ["B쪽 설명"]

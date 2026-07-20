@@ -237,6 +237,11 @@ def store_extraction(collection: str, result: ExtractionResult, source_doc: str)
         resolved_name = _resolve_canonical_name(collection, entity.name)
         # entity.type은 EntityType(Enum)이라 DB(STRING)에는 순수 값 문자열("PERSON")로 풀어 저장한다.
         graph_manager.upsert_entity(collection, resolved_name, entity.type.value, entity.description)
+        # [M1.5] hot-path의 description은 위에서 이미 그대로 채웠다(로컬 질의가 그걸 쓰므로 절대 비우지 않음).
+        # 이 후보 적재는 그와 '병행 추가'일 뿐 — source_doc 키로 쌓아뒀다가 옵트인 배치
+        # (summarize-descriptions)가 나중에 여러 문서의 설명을 하나로 통합할 때 재료로 쓴다.
+        if entity.description:
+            sqlite_manager.upsert_desc_candidate(collection, resolved_name, source_doc, entity.description)
     for relation in result.relations:
         graph_manager.upsert_relation(
             collection,

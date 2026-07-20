@@ -107,6 +107,21 @@ def init_schema() -> None:
             )
             """
         )
+        # 엔티티 설명 후보(M1.5) — 같은 엔티티가 여러 문서에서 언급될 때마다 description 후보를 쌓는다.
+        # source_doc으로 키잉해, 문서 재처리/삭제 시 그 문서가 남긴 후보만 정확히 지울 수 있다(유령 후보 방지,
+        # spec-addendum §C-4). 같은 문서 안에서 같은 엔티티가 여러 청크에 걸쳐 또 나오면 그 문서의 후보 1행만
+        # 최신 내용으로 갱신한다(REPLACE) — 문서 간 다중 후보만 통합 요약의 재료가 된다.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_desc_candidates (
+                collection TEXT NOT NULL,
+                entity_name TEXT NOT NULL,
+                source_doc TEXT NOT NULL,
+                description TEXT NOT NULL,
+                PRIMARY KEY (collection, entity_name, source_doc)
+            )
+            """
+        )
         # (collection, file_name)을 문서의 자연 식별자로 강제한다. 같은 파일명을 다른 사업(컬렉션)에서 써도
         # 충돌하지 않게 하고, 같은 컬렉션 안에서 같은 파일 재처리 시 옛 행이 자동 교체(유령 행 방지)되게 한다.
         # 기존 DB에 중복 행이 있으면 가장 최근(rowid 최대) 행만 남기고 정리한 뒤 UNIQUE로 승격한다.
@@ -335,3 +350,54 @@ def remove_merge_blacklist(collection: str, node_a: str, node_b: str) -> None:
             """,
             (collection, node_a, node_b, node_b, node_a),
         )
+
+
+# 엔티티 설명 후보 하나를 (collection, entity_name, source_doc) 키로 기록/갱신한다(M1.5).
+# 같은 문서가 같은 엔티티를 다시 언급하면(같은 문서 안 다른 청크) 그 문서 몫 후보 1행만 최신 내용으로 갱신된다.
+def upsert_desc_candidate(collection: str, entity_name: str, source_doc: str, description: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            REPLACE INTO entity_desc_candidates (collection, entity_name, source_doc, description)
+            VALUES (?, ?, ?, ?)
+            """,
+            (collection, entity_name, source_doc, description),
+        )
+
+
+# 한 엔티티(해당 컬렉션)에 쌓인 설명 후보 전체를 가져온다. source_doc 사전순으로 반환해 결정적이게 한다.
+def get_desc_candidates(collection: str, entity_name: str) -> list[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT description FROM entity_desc_candidates "
+            "WHERE collection = ? AND entity_name = ? ORDER BY source_doc",
+            (collection, entity_name),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+# 해당 컬렉션에서 설명 후보가 min_count개 이상 쌓인 엔티티 이름만 가져온다(요약 배치의 대상 선정용).
+def get_entities_with_min_candidates(collection: str, min_count: int) -> list[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT entity_name FROM entity_desc_candidates
+            WHERE collection = ?
+            GROUP BY entity_name
+            HAVING COUNT(*) >= ?
+            """,
+            (collection, min_count),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+# 특정 문서(source_doc)가 남긴 설명 후보를 전부 삭제한다(문서 재처리/삭제 시 호출 — 유령 후보 방지).
+def delete_desc_candidates_by_source_doc(source_doc: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM entity_desc_candidates WHERE source_doc = ?", (source_doc,))
+
+
+# 한 컬렉션의 설명 후보를 전부 삭제한다(컬렉션 통째 삭제 시 호출 — 다른 데이터와 동일한 캐스케이드 패턴).
+def delete_desc_candidates_by_collection(collection: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM entity_desc_candidates WHERE collection = ?", (collection,))

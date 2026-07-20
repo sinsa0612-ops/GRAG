@@ -286,6 +286,14 @@ def cmd_merge(args) -> None:
     print("병합 작업 완료")
 
 
+# 설명 후보가 min_candidates개 이상 쌓인 엔티티만 로컬 LLM(기본 Ollama)으로 통합 요약한다(옵트인 배치, M1.5).
+def cmd_summarize_descriptions(args) -> None:
+    from pipeline import desc_summarizer
+
+    updated = desc_summarizer.summarize_descriptions(args.collection, min_candidates=args.min_candidates)
+    print(f"[{args.collection}] 설명 통합 완료: {updated}개 엔티티")
+
+
 # "컬렉션:이름" 형식 인자를 (컬렉션, 이름)으로 가른다. 형식이 틀리면 None.
 def _parse_ref(ref: str) -> tuple[str, str] | None:
     if not ref or ":" not in ref:
@@ -467,6 +475,16 @@ def main(argv: list[str] | None = None) -> None:
     p_merge.add_argument("--collection", help="범위 컬렉션(쉼표로 여러 개)")
     p_merge.add_argument("--all", action="store_true", help="전체 컬렉션")
     p_merge.set_defaults(func=cmd_merge)
+
+    p_summarize = sub.add_parser(
+        "summarize-descriptions", help="설명 후보를 로컬 LLM(Ollama)으로 통합 요약(옵트인 배치)"
+    )
+    p_summarize.add_argument("--collection", required=True, help="대상 컬렉션(사업) 이름")
+    p_summarize.add_argument(
+        "--min-candidates", type=int, dest="min_candidates",
+        help="통합 요약을 트리거할 최소 후보 수(기본: 설정값)",
+    )
+    p_summarize.set_defaults(func=cmd_summarize_descriptions)
 
     p_bridge = sub.add_parser("bridge", help="컬렉션 간 같은 대상 연결(SAME_AS 브릿지)")
     p_bridge.add_argument("action", choices=["add", "remove", "list", "suggest"], help="동작")

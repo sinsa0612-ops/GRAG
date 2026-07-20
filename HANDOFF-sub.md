@@ -2,6 +2,68 @@
 
 > AI 주도권 문서. 세션별 세부 변경 이력·현재 상태·미해결 문제·다음 단계를 기록한다.
 
+## 📅 2026-07-20 세션 — M1.5: 엔티티 설명 통합 요약(#6, 부분→정석)
+
+### 배경
+- M1(`5f841f6`)이 만든 LLM 백엔드 라우터(`generate(..., backend="ollama")`) 위에, canonical GraphRAG의
+  "다중 언급 설명을 하나로 통합" 격차를 메운다. 지금까지는 같은 엔티티가 여러 문서에서 나오면
+  `graph_manager.upsert_entity`의 `ON MATCH SET e.description = $description`이 마지막 값으로 덮어썼다.
+
+### 변경 (✅ 구현·검증 완료 / ⏳ 커밋 대기 — 커밋은 오케스트레이터가 CEO 결재 후 별도 처리)
+- **`db/sqlite_manager.py`:** `entity_desc_candidates(collection, entity_name, source_doc, description)` 신설
+  (PK 3종 복합). CRUD 5종: `upsert_desc_candidate`/`get_desc_candidates`/`get_entities_with_min_candidates`/
+  `delete_desc_candidates_by_source_doc`/`delete_desc_candidates_by_collection`. source_doc 키로 문서 단위
+  캐스케이드 삭제가 정확히 짚히게 했다(유령 후보 방지).
+- **`db/graph_manager.py`:** `update_entity_description(collection, name, description)` 신설 — description만
+  바꾸고 type/aliases는 안 건드림(요약 배치 전용, upsert_entity와 달리 type 재전달 불필요).
+- **`pipeline/ingest.py` (`store_extraction`):** 엔티티 upsert 직후, description이 비어있지 않으면
+  `(collection, resolved_name, source_doc)` 키로 후보를 병행 적재. **hot-path 불변 확인:** description은
+  지금처럼 즉시 채워짐(로컬 질의 영향 없음), 후보 적재는 순수 DB 쓰기라 인제스트 경로에 LLM 호출 추가 없음.
+- **`pipeline/desc_summarizer.py` (신규):** `summarize_descriptions(collection, min_candidates=None,
+  backend="ollama", model=None)` — 후보 `min_candidates`(기본 `config.desc_summary_min_candidates=2`)개
+  이상인 엔티티만 도메인·언어 중립 프롬프트로 Ollama에 통합 요약 요청, 성공 시 `update_entity_description`으로
+  교체. 후보 1개는 LLM 호출 없이 스킵(호출 절약). 요약 실패/빈 응답인 엔티티는 건너뛰고 기존 설명 유지(다른
+  엔티티 처리는 안 막힘).
+- **`db/document_store.py`:** `commit_document`(재처리 시 옛 source_id 정리)·`delete_document`·
+  `delete_collection`·`cleanup_orphaned_data` 4곳에 설명 후보 캐스케이드 삭제 호출 추가(기존
+  `delete_relations_by_source_doc` 패턴과 동일한 지점). `delete_collection` 캐스케이드는 작업지시서엔 명시
+  안 됐지만, 다른 데이터(엔티티/벡터/문서)가 이미 컬렉션 통째 삭제되는 지점이라 후보만 안 지우면 이 기능이
+  스스로 유령 데이터를 만드는 셈이라 판단해 포함([ASSUMPTION] 범위 판단, 1줄 추가).
+- **`graphrag_cli.py`:** `summarize-descriptions --collection C [--min-candidates N]` 서브커맨드 신설
+  (옵트인 배치, `p_merge`/`p_bridge` 사이에 배치).
+- **`config.py`:** `desc_summary_min_candidates: int = 2` 추가(하드코딩 금지, 단일 출처).
+
+### 검증
+- `pytest -q` **193 passed**(기존 170 + 신규 23, 0 failed). 신규 테스트 분포:
+  `test_sqlite_manager.py`+6, `test_graph_manager.py`+1, `test_pipeline_ingest.py`+4(hot-path 불변 명시
+  assert 포함), `test_document_store.py`+4(캐스케이드), `test_desc_summarizer.py`+7(병합/스킵/설정 기본값/
+  실패격리/실 Ollama skipif), `test_graphrag_cli.py`+1(CLI 배선).
+- 기존 테스트 1건(`test_store_extraction_merges_known_alias_instead_of_creating_new_node`)이
+  `store_extraction`의 새 sqlite 의존성 때문에 `sqlite_manager.init_schema()` 호출이 필요해져 1줄 추가(내
+  변경이 만든 정당한 신규 의존성).
+- **실 Ollama 통합 테스트가 로컬에서 실제로 통과함**(스킵 아님 — Ollama 기동 중, qwen3:14b 응답 확인).
+- **CLI 엔드투엔드 스모크(운영 DB 미접근, `DB_DIR` 스크래치 격리):** 후보 2개("아침 회의 주재"/"오후 보고서
+  작성") 수동 적재 → `graphrag summarize-descriptions --collection 스모크테스트` 실행 →
+  `"아침에 회의를 주재한 홍길동은 오후에 보고서를 작성했다"`로 실제 통합됨을 확인. 스크래치 삭제 완료.
+
+### ⚠️ 알려진 한계(범위 밖으로 남긴 것)
+1. `entity_resolution.merge_entity_into`로 엔티티가 병합(drop)돼도 그 이름의 옛 설명 후보 행은 안 지워짐 —
+   요약 대상 조회는 canonical 이름으로만 하므로 orphan 후보는 그냥 안 쓰이고 남을 뿐(정합성 버그는 아니고
+   저장공간 낭비 수준). M1.5 범위 밖(작업지시서 "커뮤니티·글로벌·기존 Gemini 로직만 범위 밖" 명시, 이 항목은
+   언급 안 됐으나 최소 변경 원칙상 손대지 않음).
+2. `--min-candidates`를 CLI에서 안 주면 config 기본값(2) 사용 — 이 커맨드는 컬렉션당 1회성 배치라 매번 수동
+   실행(자동 트리거 없음, M1.5 스펙대로 옵트인).
+
+### ▶️ 다음 단계
+1. **커밋 대기** — 오케스트레이터가 CEO 결재 후 진행. 변경 파일 목록은 이번 세션 diff 참조(`config.py
+   db/document_store.py db/graph_manager.py db/sqlite_manager.py graphrag_cli.py pipeline/ingest.py
+   pipeline/desc_summarizer.py tests/test_document_store.py tests/test_graph_manager.py
+   tests/test_graphrag_cli.py tests/test_pipeline_ingest.py tests/test_sqlite_manager.py
+   tests/test_desc_summarizer.py HANDOFF-sub.md`).
+2. (선택) M2 착수 전, 실데이터 소규모 컬렉션으로 Ollama 통합요약 품질을 육안 확인(한국어 뉘앙스 — spec.md
+   Risk 1과 별개로 설명요약 자체의 품질 체감).
+3. M2(Leiden 계층 탐지)는 spec.md/addendum 순서대로 별도 세션.
+
 ## 📅 2026-07-02 세션 — retrieval 투자 1차: 답변 합성 충실성 재구성
 
 ### 배경

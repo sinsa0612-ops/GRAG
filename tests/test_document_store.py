@@ -234,3 +234,72 @@ def test_cleanup_orphaned_data_removes_untracked_relations():
 
     assert removed == 1
     assert graph_manager.get_outgoing_relations(C, "A") == []
+
+
+# --- M1.5: 설명 후보(entity_desc_candidates) 캐스케이드 — 유령 후보 방지(spec-addendum §C-4) ---
+
+
+def test_commit_document_cleans_up_old_desc_candidates(monkeypatch):
+    # 문서 재처리 시 옛 source_id가 남긴 설명 후보는 정확히 제거되고, 새 문서 후보만 남아야 한다.
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr(
+        "db.document_store.vector_manager.delete_chunks_by_source", lambda source_id: None
+    )
+
+    first_id = document_store.prepare_replacement("memo.md")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", first_id, "첫 버전 설명")
+    document_store.commit_document(first_id, C, "memo.md", "첫 버전", "hash_a")
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["첫 버전 설명"]
+
+    second_id = document_store.prepare_replacement("memo.md")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", second_id, "둘째 버전 설명")
+    document_store.commit_document(second_id, C, "memo.md", "둘째 버전", "hash_b")
+
+    # 옛 문서(first_id) 후보는 사라지고 새 문서(second_id) 후보만 남아야 한다(유령 후보 없음).
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["둘째 버전 설명"]
+
+
+def test_delete_document_removes_desc_candidates(monkeypatch):
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr(
+        "db.document_store.vector_manager.delete_chunks_by_source", lambda source_id: None
+    )
+    source_id = document_store.prepare_replacement("memo.md")
+    sqlite_manager.upsert_desc_candidate(C, "강택리", source_id, "설명")
+    document_store.commit_document(source_id, C, "memo.md", "내용", "hash_a")
+
+    document_store.delete_document(C, "memo.md")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == []
+
+
+def test_delete_collection_removes_desc_candidates_scoped_to_that_collection(monkeypatch):
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr("db.document_store.vector_manager.delete_chunks_by_collection", lambda c: None)
+
+    sqlite_manager.upsert_document("doc_a", "사업A", "memo.md", "내용", "h")
+    sqlite_manager.upsert_desc_candidate("사업A", "김부장", "doc_a", "A쪽 설명")
+    sqlite_manager.upsert_desc_candidate("사업B", "이대리", "doc_b", "B쪽 설명")
+
+    document_store.delete_collection("사업A")
+
+    assert sqlite_manager.get_desc_candidates("사업A", "김부장") == []
+    assert sqlite_manager.get_desc_candidates("사업B", "이대리") == ["B쪽 설명"]
+
+
+def test_cleanup_orphaned_data_removes_orphaned_desc_candidates():
+    # 처리 중간에 끊겨 문서 기록이 없는 source_id의 설명 후보도 고아 정리 대상이어야 한다.
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    graph_manager.upsert_entity(C, "A", "Person", "")
+    graph_manager.upsert_entity(C, "B", "Person", "")
+    graph_manager.upsert_relation(C, "A", "B", "KNOWS", "", "doc_orphan")
+    sqlite_manager.upsert_desc_candidate(C, "A", "doc_orphan", "고아 설명")
+
+    removed = document_store.cleanup_orphaned_data()
+
+    assert removed == 1
+    assert sqlite_manager.get_desc_candidates(C, "A") == []

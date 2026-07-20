@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # CLI 백엔드 subprocess 타임아웃(초). 에이전트형 CLI라 단순 API 콜보다 오래 걸릴 수 있다.
     cli_llm_timeout_sec: float = 300.0
 
+    # --- 설명 요약(M1.5, 옵트인 배치) 설정 ---
+    # 엔티티 설명 후보가 이 개수 이상 쌓여야 통합 요약을 트리거한다(후보 1개는 통합할 게 없어 스킵, 호출 절약).
+    desc_summary_min_candidates: int = 2
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:

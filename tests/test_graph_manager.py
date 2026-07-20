@@ -65,6 +65,20 @@ def test_upsert_relation_skips_and_warns_when_entity_missing(caplog):
     assert any("존재하지 않음" in record.message for record in caplog.records)
 
 
+def test_update_entity_description_leaves_type_and_aliases_untouched():
+    # M1.5 설명요약 배치가 쓰는 함수 — description만 바뀌고 type/aliases는 그대로여야 한다.
+    graph_manager.init_schema()
+    graph_manager.upsert_entity(C, "강택리", "Person", "옛 설명")
+    graph_manager.add_alias(C, "강택리", "택리")
+
+    graph_manager.update_entity_description(C, "강택리", "통합된 새 설명")
+
+    entity = graph_manager.get_entity(C, "강택리")
+    assert entity["description"] == "통합된 새 설명"
+    assert entity["type"] == "Person"
+    assert entity["aliases"] == ["택리"]
+
+
 def test_get_entity_includes_aliases():
     graph_manager.init_schema()
     graph_manager.upsert_entity(C, "ISA계좌", "Asset", "절세용 계좌")

@@ -227,6 +227,7 @@ def test_resolve_canonical_name_keeps_genuinely_new_name():
 
 def test_store_extraction_merges_known_alias_instead_of_creating_new_node():
     graph_manager.init_schema()
+    sqlite_manager.init_schema()  # [M1.5] store_extraction이 설명 후보도 sqlite에 병행 적재하므로 필요
     graph_manager.upsert_entity(C, "ISA계좌", "Asset", "절세용 계좌")
     graph_manager.add_alias(C, "ISA계좌", "ISA 계좌")
 
@@ -275,6 +276,82 @@ def test_glean_chunk_dedupes_repeated_entities(monkeypatch):
 
     assert [e.name for e in result.entities] == ["A"]  # 중복 없음
     assert extra_calls == 1  # 첫 라운드에서 새 게 없어 바로 종료
+
+
+# --- M1.5: 설명 후보(entity_desc_candidates) 적재 + hot-path 불변 ---
+
+
+def test_store_extraction_fills_description_and_records_candidate():
+    # hot-path 회귀 방지: description은 지금처럼 즉시 채워지고(로컬 질의가 그걸 씀),
+    # source_doc 키의 후보도 '병행 추가'로 함께 적재돼야 한다(둘 다, 후자만이 아님).
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="기획자")], relations=[]
+    )
+    ingest.store_extraction(C, result, "doc1")
+
+    entity = graph_manager.get_entity(C, "강택리")
+    assert entity["description"] == "기획자"  # hot-path 불변
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["기획자"]
+
+
+def test_store_extraction_keys_candidates_by_source_doc():
+    # 같은 엔티티가 다른 문서에서 다시 언급되면, source_doc이 다른 별개 후보로 쌓여야 한다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result_doc1 = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="1번 문서 설명")], relations=[]
+    )
+    result_doc2 = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="2번 문서 설명")], relations=[]
+    )
+    ingest.store_extraction(C, result_doc1, "doc1")
+    ingest.store_extraction(C, result_doc2, "doc2")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["1번 문서 설명", "2번 문서 설명"]
+    # hot-path description은 가장 최근 upsert 값으로 남아있어야 한다(현행 동작 불변).
+    assert graph_manager.get_entity(C, "강택리")["description"] == "2번 문서 설명"
+
+
+def test_store_extraction_skips_candidate_for_empty_description():
+    # 빈 description은 통합할 재료가 아니므로 후보로 남기지 않는다(빈 문자열이 카운트를 오염시키지 않게).
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[ExtractedEntity(name="강택리", type="PERSON", description="")], relations=[]
+    )
+    ingest.store_extraction(C, result, "doc1")
+
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == []
+
+
+def test_process_file_records_desc_candidates_end_to_end(tmp_path, monkeypatch):
+    # ingest CLI 경로(process_file) 전체를 통해서도 후보가 source_doc 키로 남는지 확인한다.
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+    ingest.process_file(file_path, C)
+
+    source_id = sqlite_manager.get_document_source_id(C, "memo.md")
+    assert sqlite_manager.get_desc_candidates(C, "강택리") == ["기획자"]
+    # 저장된 후보가 실제로 그 문서의 source_id를 키로 쓰는지 확인(캐스케이드 삭제가 정확히 짚을 수 있어야 함).
+    with sqlite_manager.get_connection() as conn:
+        row = conn.execute(
+            "SELECT source_doc FROM entity_desc_candidates WHERE collection = ? AND entity_name = ?",
+            (C, "강택리"),
+        ).fetchone()
+    assert row[0] == source_id
 
 
 def test_process_file_gleaning_adds_missed_entities(tmp_path, monkeypatch):

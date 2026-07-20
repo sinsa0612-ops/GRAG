@@ -97,6 +97,16 @@ def upsert_entity(collection: str, name: str, entity_type: str, description: str
     )
 
 
+# 엔티티의 description만 갱신한다(type/aliases는 건드리지 않음). 설명요약 배치(M1.5)가 여러 문서의
+# 설명 후보를 하나로 통합한 결과로 교체할 때 쓴다 — upsert_entity와 달리 type을 다시 넘길 필요가 없다.
+def update_entity_description(collection: str, name: str, description: str) -> None:
+    conn = _get_connection()
+    conn.execute(
+        "MATCH (e:Entity {id: $id}) SET e.description = $description",
+        {"id": _entity_id(collection, name), "description": description},
+    )
+
+
 # 해당 컬렉션 안에 이름으로 엔티티가 존재하는지 확인한다 (관계 저장 전 무결성 검사용).
 def entity_exists(collection: str, name: str) -> bool:
     conn = _get_connection()
