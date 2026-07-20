@@ -23,7 +23,10 @@ class LocalLLMError(RuntimeError):
 def generate(prompt: str, model: str | None = None) -> str:
     model = model or settings.ollama_model_name
     url = f"{settings.ollama_base_url}/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False}
+    # think=False: qwen3 계열의 추론(<think> 체인)을 꺼 추출·요약을 빠르고 깨끗한 직답으로 받는다.
+    # (추론이 켜지면 추출처럼 긴 프롬프트는 청크당 120초 타임아웃 — 이 파이프라인은 로컬 모델의
+    #  사고연쇄가 불필요하고, <think> 태그가 방어적 JSON 파서를 오염시킬 수도 있다.)
+    payload = {"model": model, "prompt": prompt, "stream": False, "think": False}
 
     try:
         response = requests.post(url, json=payload, timeout=settings.ollama_request_timeout_sec)

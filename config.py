@@ -57,8 +57,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     # 로컬 LLM 백엔드 기본 모델(이미 로컬에 받아둔 모델, 재다운로드 없음).
     ollama_model_name: str = "qwen3:14b"
-    # Ollama 요청 타임아웃(초). 배치 요약 1콜이 ~10~40초 걸릴 수 있어 여유를 둔다.
-    ollama_request_timeout_sec: float = 120.0
+    # Ollama 요청 타임아웃(초). 로컬 추출 1콜(1900자 청크 → 구조화 엔티티/관계 JSON)이 qwen3:14b에서
+    # 실측 ~250초 걸린다(요약 콜은 수십 초). Gemini 폴백이 없는 완전 로컬 구성이라 추출이 유일 경로이므로,
+    # 추출 1콜이 완주할 수 있게 여유를 둔다(120초로는 추출이 전부 타임아웃났다 — 실전 검증에서 확인).
+    ollama_request_timeout_sec: float = 300.0
     # Claude/Codex CLI 바이너리 경로. 기본은 이름만 두어 PATH에서 찾게 하고(대화형 셸 함수가 아니라
     # 실바이너리가 필요), 비로그인 subprocess가 PATH로 못 찾으면 .env에서 절대경로로 오버라이드한다.
     claude_cli_path: str = "claude"

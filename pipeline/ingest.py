@@ -158,12 +158,14 @@ def extract_chunk(
     known_names: list[str] | None = None,
     known_predicates: list[str] | None = None,
     model: str | None = None,
+    backend: str | None = None,
 ) -> ExtractionResult | None:
     try:
         raw_text = generate(
             _build_prompt(chunk, known_names or [], known_predicates or []),
             response_schema=ExtractionResult,
             model=model,
+            backend=backend,
         )
     except Exception as exc:
         logger.error("LLM 호출 실패, 이 청크는 건너뜀: %s", exc)
@@ -184,6 +186,7 @@ def glean_chunk(
     base: ExtractionResult,
     rounds: int,
     model: str | None = None,
+    backend: str | None = None,
 ) -> tuple[ExtractionResult, int]:
     entities = {e.name: e for e in base.entities}  # 이름 기준 dedupe
     relations = {(r.source, r.predicate, r.target): r for r in base.relations}
@@ -198,7 +201,9 @@ def glean_chunk(
         )
         extra_calls += 1
         try:
-            extra = _parse_extraction(generate(prompt, response_schema=ExtractionResult, model=model))
+            extra = _parse_extraction(
+                generate(prompt, response_schema=ExtractionResult, model=model, backend=backend)
+            )
         except Exception as exc:
             logger.warning("gleaning 라운드 실패, 이 라운드는 건너뜀: %s", exc)
             break
@@ -256,8 +261,15 @@ def store_extraction(collection: str, result: ExtractionResult, source_doc: str)
 # 파일 하나를 지정한 컬렉션(사업)으로 끝까지 처리한다 (변경 없으면 False, 처리했으면 True를 반환).
 # model로 추출 LLM 모델을, glean_rounds로 청크당 gleaning 라운드 수를 바꿀 수 있다(둘 다 없으면 설정 기본값).
 def process_file(
-    file_path: Path, collection: str, model: str | None = None, glean_rounds: int | None = None
+    file_path: Path,
+    collection: str,
+    model: str | None = None,
+    glean_rounds: int | None = None,
+    backend: str | None = None,
 ) -> bool:
+    # backend=None/"gemini"이면 기존 Gemini 경로(RPD 한도 기록 포함). "ollama"/"claude_cli"는 로컬/구독이라
+    # Gemini 일일 한도(RPD)에 안 잡히므로 record_api_usage를 건너뛴다(아래 _is_gemini 참조).
+    _is_gemini = backend in (None, "gemini")
     content = file_path.read_text(encoding="utf-8")
     file_name = file_path.name
     content_hash = document_store.compute_hash(content)
@@ -274,7 +286,8 @@ def process_file(
     rounds = settings.glean_rounds if glean_rounds is None else glean_rounds
     # 청크마다 1차 LLM 호출 1번이 나가므로, 청크 수만큼 오늘 사용량에 기록한다(RPD 추적).
     # gleaning 추가 호출은 실제 소비한 만큼 아래에서 따로 더한다.
-    sqlite_manager.record_api_usage(len(chunks))
+    if _is_gemini:
+        sqlite_manager.record_api_usage(len(chunks))
     vector_manager.add_chunks(source_id, chunks, collection)
 
     extra_calls = 0
@@ -285,20 +298,20 @@ def process_file(
         known_names = graph_manager.get_known_entity_names([collection])
         known_predicates = graph_manager.get_known_predicates([collection])
 
-        result = extract_chunk(chunk, known_names, known_predicates, model=model)
+        result = extract_chunk(chunk, known_names, known_predicates, model=model, backend=backend)
         if result is None:
             continue
         # gleaning: 놓친 엔티티/관계를 몇 번 더 캐내 누적한다(옵트인, rounds>0일 때만).
         if rounds > 0:
-            result, calls = glean_chunk(chunk, result, rounds, model=model)
+            result, calls = glean_chunk(chunk, result, rounds, model=model, backend=backend)
             extra_calls += calls
         try:
             store_extraction(collection, result, source_id)
         except Exception as exc:
             logger.error("그래프 저장 실패, 이 청크 결과는 건너뜀: %s", exc)
 
-    if extra_calls:
-        sqlite_manager.record_api_usage(extra_calls)  # gleaning으로 추가 소비한 호출 기록
+    if extra_calls and _is_gemini:
+        sqlite_manager.record_api_usage(extra_calls)  # gleaning으로 추가 소비한 호출 기록(Gemini만)
     document_store.commit_document(source_id, collection, file_name, content, content_hash)
     # [M2] 그래프가 바뀌었으니 이 컬렉션의 커뮤니티는 재빌드가 필요하다(LLM 없이 플래그만 세팅 — 값싼 인제스트 경로 불변).
     sqlite_manager.mark_communities_dirty(collection)

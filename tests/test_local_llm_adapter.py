@@ -39,6 +39,8 @@ def test_generate_returns_response_text_on_success(monkeypatch):
     assert captured["json"]["model"] == settings.ollama_model_name
     assert captured["json"]["prompt"] == "질문"
     assert captured["json"]["stream"] is False
+    # 추론(<think>) 비활성화 — 추출/요약 같은 긴 프롬프트가 청크당 120초 타임아웃 나던 근본 원인 차단(회귀 방지).
+    assert captured["json"]["think"] is False
 
 
 def test_generate_uses_explicit_model_override(monkeypatch):

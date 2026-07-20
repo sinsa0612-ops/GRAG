@@ -98,6 +98,11 @@ def cmd_ingest(args) -> None:
     import process_inbox
 
     collection = args.collection or settings.default_collection
+    backend = getattr(args, "backend", None)
+    # ollama(로컬 무료)·claude_cli/codex_cli(구독)는 Gemini 일일 한도(RPD)와 무관 → 한도 가드/사용량 기록을 건너뛴다.
+    _is_gemini = backend in (None, "gemini")
+    if not _is_gemini:
+        print(f"추출 백엔드: {backend} (로컬/구독 — Gemini 하루 한도 미적용)")
 
     # 1) 처리 대상 파일 목록 결정
     if args.inbox:
@@ -143,8 +148,8 @@ def cmd_ingest(args) -> None:
         print("(--dry-run: 실제 처리는 하지 않았습니다)")
         return
 
-    # 3) 한도 가드
-    if used + total_est > limit and not args.force:
+    # 3) 한도 가드 (Gemini만 — ollama/CLI는 로컬/구독이라 RPD 무관)
+    if _is_gemini and used + total_est > limit and not args.force:
         print(f"\n⛔ 한도 초과 예상: {used} + {total_est} = {used + total_est} > {limit}  — 처리를 중단합니다.")
         _print_split_guidance(estimates, max(0, remaining), limit, multiplier)
         print("그래도 강행하려면 --force 를 붙이세요.")
@@ -158,7 +163,7 @@ def cmd_ingest(args) -> None:
         return
     for path, _ in estimates:
         try:
-            changed = ingest.process_file(path, collection, glean_rounds=glean)
+            changed = ingest.process_file(path, collection, glean_rounds=glean, backend=backend)
         except Exception as exc:
             failed_dir = settings.failed_dir / collection
             failed_dir.mkdir(parents=True, exist_ok=True)
@@ -527,6 +532,10 @@ def main(argv: list[str] | None = None) -> None:
     p_ingest.add_argument(
         "--glean", type=int, default=0, metavar="N",
         help="청크당 gleaning(놓친 것 추가 추출) 라운드 수. 요청 수가 최대 (1+N)배로 늘어난다. 기본 0=끔",
+    )
+    p_ingest.add_argument(
+        "--backend", choices=["gemini", "ollama", "claude_cli", "codex_cli"], default=None,
+        help="추출 LLM 백엔드(기본: Gemini). ollama=로컬 무료(RPD 한도 미적용), claude_cli/codex_cli=구독.",
     )
     p_ingest.set_defaults(func=cmd_ingest)
 

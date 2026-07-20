@@ -65,6 +65,29 @@ def test_cli_ingest_moves_failed_file_to_failed_dir(tmp_path, monkeypatch, capsy
     assert (settings.failed_dir / "사업A" / "memo.md").exists()
 
 
+def test_cli_ingest_backend_flag_threads_to_process_file(tmp_path, monkeypatch):
+    # --backend ollama 가 process_file까지 그대로 전달되고(라우터가 어댑터를 고를 수 있게),
+    # 플래그가 없으면 기본 None(=Gemini)으로 전달되는지 확인한다.
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    seen = {}
+
+    def spy_process_file(path, collection, *, glean_rounds=None, backend=None, **kwargs):
+        seen["backend"] = backend
+        return True
+
+    monkeypatch.setattr(ingest, "process_file", spy_process_file)
+    graphrag_cli.main(["init"])
+    memo = tmp_path / "memo.md"
+    memo.write_text("아무 메모", encoding="utf-8")
+
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A", "--backend", "ollama"])
+    assert seen["backend"] == "ollama"
+
+    memo.write_text("아무 메모2", encoding="utf-8")  # 해시가 달라야 재처리됨
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A"])
+    assert seen["backend"] is None  # 플래그 없으면 기본 Gemini 경로
+
+
 def test_cli_delete_collection_clears_it(tmp_path, monkeypatch, capsys):
     # 잘못 넣은 컬렉션을 delete-collection으로 통째 비우면 엔티티가 사라져야 한다(롤백 용도).
     monkeypatch.setattr(settings, "project_root", tmp_path)

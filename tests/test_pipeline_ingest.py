@@ -391,3 +391,59 @@ def test_process_file_gleaning_adds_missed_entities(tmp_path, monkeypatch):
     assert ingest.process_file(file_path, C, glean_rounds=1) is True
     names = {e["name"] for e in graph_manager.get_all_entities()}
     assert {"에이", "비이"} <= names
+
+
+# --- 추출 백엔드 선택(--backend) + RPD 한도 기록 스킵 ---
+
+
+def test_process_file_ollama_backend_skips_rpd_usage(tmp_path, monkeypatch):
+    # ollama(로컬 무료)/CLI(구독) 백엔드는 Gemini 일일 한도(RPD)와 무관하므로 record_api_usage를 호출하면 안 된다.
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    calls = {"n": 0}
+    monkeypatch.setattr(sqlite_manager, "record_api_usage", lambda n: calls.__setitem__("n", calls["n"] + 1))
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, backend="ollama") is True
+    assert calls["n"] == 0  # 로컬/구독 백엔드는 RPD를 소비하지 않음
+
+
+def test_process_file_default_backend_records_rpd_usage(tmp_path, monkeypatch):
+    # 대조군: 기본(Gemini) 백엔드는 기존대로 청크 수만큼 RPD를 기록해야 한다(스킵이 무조건이 아님을 고정).
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    calls = {"n": 0}
+    monkeypatch.setattr(sqlite_manager, "record_api_usage", lambda n: calls.__setitem__("n", calls["n"] + 1))
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C) is True  # backend 미지정 = Gemini
+    assert calls["n"] >= 1  # 기존 RPD 기록 경로 불변
+
+
+def test_process_file_forwards_backend_to_generate(tmp_path, monkeypatch):
+    # process_file → extract_chunk → generate 로 backend 문자열이 그대로 전달돼야 한다(라우터가 어댑터를 고를 수 있게).
+    seen_backends = []
+
+    def capturing_generate(prompt, **kwargs):
+        seen_backends.append(kwargs.get("backend"))
+        return VALID_RESPONSE
+
+    monkeypatch.setattr(ingest, "generate", capturing_generate)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    monkeypatch.setattr(sqlite_manager, "record_api_usage", lambda n: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    ingest.process_file(file_path, C, backend="ollama")
+    assert seen_backends and all(b == "ollama" for b in seen_backends)
