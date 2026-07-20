@@ -52,6 +52,20 @@ class Settings(BaseSettings):
     # 백업(backups/)을 최신 몇 개까지 보관할지. 새 백업을 만들 때마다 이 개수를 넘는 오래된 백업은 자동 삭제한다.
     backup_keep: int = 10
 
+    # --- 신규 LLM 백엔드(옵트인) 설정 — 기본 Gemini 경로에는 영향 없음 ---
+    # Ollama(로컬 LLM) HTTP 엔드포인트. 로컬 기본 포트가 11434.
+    ollama_base_url: str = "http://localhost:11434"
+    # 로컬 LLM 백엔드 기본 모델(이미 로컬에 받아둔 모델, 재다운로드 없음).
+    ollama_model_name: str = "qwen3:14b"
+    # Ollama 요청 타임아웃(초). 배치 요약 1콜이 ~10~40초 걸릴 수 있어 여유를 둔다.
+    ollama_request_timeout_sec: float = 120.0
+    # Claude/Codex CLI 바이너리 경로. 기본은 이름만 두어 PATH에서 찾게 하고(대화형 셸 함수가 아니라
+    # 실바이너리가 필요), 비로그인 subprocess가 PATH로 못 찾으면 .env에서 절대경로로 오버라이드한다.
+    claude_cli_path: str = "claude"
+    codex_cli_path: str = "codex"
+    # CLI 백엔드 subprocess 타임아웃(초). 에이전트형 CLI라 단순 API 콜보다 오래 걸릴 수 있다.
+    cli_llm_timeout_sec: float = 300.0
+
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.
     def sqlite_path(self) -> Path:

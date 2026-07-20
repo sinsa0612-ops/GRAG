@@ -1,4 +1,6 @@
-# Gemini API 호출을 격리하는 어댑터 — 다른 모듈은 google-genai의 존재를 모른다.
+# LLM 백엔드 얇은 라우터 — backend 문자열로 각 어댑터에 디스패치만 한다(SPEC §1.3).
+# Gemini(기본) 경로는 이 파일 안에 그대로 있고(다른 모듈은 google-genai의 존재를 모른다),
+# ollama/claude_cli/codex_cli는 각자의 전용 어댑터 모듈(local_llm_adapter/cli_llm_adapter)이 격리한다.
 import logging
 import time
 
@@ -45,13 +47,31 @@ def _request_interval(model: str) -> float:
     return settings.llm_request_interval_sec
 
 
-# 프롬프트를 Gemini/Gemma에 전달하고 응답 텍스트를 반환한다.
-# model을 주면 그 모델로(없으면 설정 기본 모델 llm_model_name), response_schema가 주어지고 그 모델이
-# 구조화 출력을 지원할 때만 JSON 모드로 호출한다(미지원 모델은 프롬프트 기반 JSON으로 받아 호출부가 파싱).
-# 안전필터 등으로 응답이 비면 response.text가 None이라 빈 문자열로 방어한다(호출부의 파싱이 None에서 터지지 않게).
-# 일시적 오류는 설정된 횟수만큼 점진적으로 대기하며 재시도하고, 영구적 오류는 즉시 포기한다.
-# 성공/실패 시도 모두 무료 한도 보호용 대기(모델별 간격)를 적용한다.
-def generate(prompt: str, response_schema: type | None = None, model: str | None = None) -> str:
+# 프롬프트를 지정된 backend로 전달하고 응답 텍스트를 반환한다.
+# backend=None(기본)/"gemini" -> 아래의 기존 Gemini/Gemma 경로 그대로(바이트 동일, hot-path 불변).
+# backend="ollama" -> local_llm_adapter(Ollama HTTP)로 위임. backend="claude_cli"/"codex_cli" ->
+# cli_llm_adapter(subprocess File-IPC)로 위임. 두 신규 백엔드 모두 response_schema를 지원하지 않으므로
+# (구조화 출력 강제 불가) 무시하고, 호출부가 기존 Gemma 대응과 동형으로 원문을 방어적 파싱한다.
+# 어댑터 모듈은 실제로 그 backend가 쓰일 때만 import한다(불필요한 의존 로드를 피하고, 한 백엔드의
+# import 실패가 다른 백엔드/기본 경로에 영향을 주지 않게 한다).
+def generate(
+    prompt: str,
+    response_schema: type | None = None,
+    model: str | None = None,
+    backend: str | None = None,
+) -> str:
+    if backend == "ollama":
+        from adapters.local_llm_adapter import generate as _ollama_generate
+
+        return _ollama_generate(prompt, model=model)
+    if backend in ("claude_cli", "codex_cli"):
+        from adapters.cli_llm_adapter import generate as _cli_generate
+
+        return _cli_generate(prompt, backend=backend, model=model)
+    if backend not in (None, "gemini"):
+        raise ValueError(f"알 수 없는 backend: {backend!r}")
+
+    # --- 이하 기존 Gemini/Gemma 경로 (수정 없음, backend 미지정 시 100% 동일 동작) ---
     client = _get_client()
     model = model or settings.llm_model_name
 

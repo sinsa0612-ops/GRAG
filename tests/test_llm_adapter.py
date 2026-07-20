@@ -87,3 +87,90 @@ def test_generate_gives_up_after_max_retries(monkeypatch):
         llm_adapter.generate("프롬프트")
 
     assert fake_client.models.call_count == 3
+
+
+# --- backend 라우팅 테스트 (SPEC §1.3 / addendum §D) ---
+
+
+# backend를 아예 안 주면(기존 호출부와 동일) 새 백엔드는 전혀 건드리지 않고 기존 Gemini 경로가
+# 정확히 그대로 호출됨을 증명한다 — hot-path 불변식의 핵심 증거.
+def test_generate_without_backend_calls_gemini_path_unchanged(monkeypatch):
+    fake_client = _FakeClient(["성공 응답"])
+    _patch_common(monkeypatch, fake_client)
+
+    result = llm_adapter.generate("프롬프트")
+
+    assert result == "성공 응답"
+    assert fake_client.models.call_count == 1
+
+
+# backend="gemini"를 명시해도 backend=None과 완전히 동일하게 동작해야 한다.
+def test_generate_with_explicit_gemini_backend_same_as_default(monkeypatch):
+    fake_client = _FakeClient(["성공 응답"])
+    _patch_common(monkeypatch, fake_client)
+
+    result = llm_adapter.generate("프롬프트", backend="gemini")
+
+    assert result == "성공 응답"
+    assert fake_client.models.call_count == 1
+
+
+# backend="ollama"는 local_llm_adapter.generate로 위임되고, Gemini 클라이언트는 전혀 생성되지 않는다.
+def test_generate_routes_ollama_backend_to_local_llm_adapter(monkeypatch):
+    import adapters.local_llm_adapter as local_llm_adapter
+
+    calls = {}
+
+    def fake_ollama_generate(prompt, model=None):
+        calls["prompt"] = prompt
+        calls["model"] = model
+        return "ollama 응답"
+
+    monkeypatch.setattr(local_llm_adapter, "generate", fake_ollama_generate)
+    # Gemini 클라이언트가 실수로라도 생성되면 곧바로 실패하도록 예외를 심어둔다.
+    monkeypatch.setattr(
+        llm_adapter,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Gemini 클라이언트가 호출되면 안 됨")),
+    )
+
+    result = llm_adapter.generate("프롬프트", model="qwen3:14b", backend="ollama")
+
+    assert result == "ollama 응답"
+    assert calls == {"prompt": "프롬프트", "model": "qwen3:14b"}
+
+
+# backend="claude_cli"는 cli_llm_adapter.generate로 위임되고, Gemini 클라이언트는 생성되지 않는다.
+def test_generate_routes_claude_cli_backend_to_cli_llm_adapter(monkeypatch):
+    import adapters.cli_llm_adapter as cli_llm_adapter
+
+    calls = {}
+
+    def fake_cli_generate(prompt, backend, model=None):
+        calls["prompt"] = prompt
+        calls["backend"] = backend
+        return "claude_cli 응답"
+
+    monkeypatch.setattr(cli_llm_adapter, "generate", fake_cli_generate)
+    monkeypatch.setattr(
+        llm_adapter,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Gemini 클라이언트가 호출되면 안 됨")),
+    )
+
+    result = llm_adapter.generate("프롬프트", backend="claude_cli")
+
+    assert result == "claude_cli 응답"
+    assert calls == {"prompt": "프롬프트", "backend": "claude_cli"}
+
+
+# 알 수 없는 backend 문자열은 ValueError로 즉시 거부한다(조용히 Gemini로 새지 않음).
+def test_generate_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setattr(
+        llm_adapter,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Gemini 클라이언트가 호출되면 안 됨")),
+    )
+
+    with pytest.raises(ValueError):
+        llm_adapter.generate("프롬프트", backend="does_not_exist")
