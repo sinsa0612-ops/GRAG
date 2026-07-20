@@ -176,11 +176,16 @@ def init_schema() -> None:
                 title TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 rating REAL,
+                content_signature TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (collection, community_id)
             )
             """
         )
+        # [M5] 증분 재계산용 content_signature 컬럼 마이그레이션(기존 DB엔 없을 수 있음).
+        report_cols = {row[1] for row in conn.execute("PRAGMA table_info(community_reports)").fetchall()}
+        if "content_signature" not in report_cols:
+            conn.execute("ALTER TABLE community_reports ADD COLUMN content_signature TEXT")
 
 
 # 컬렉션+파일명으로 저장된 마지막 content_hash를 조회한다 (없으면 None).
@@ -558,17 +563,19 @@ def delete_community_build_state(collection: str) -> None:
 
 
 # 한 커뮤니티의 리포트를 새로 쓰거나 갱신한다(REPLACE — updated_at은 호출 시점으로 항상 갱신).
+# content_signature는 [M5] 증분 재계산용 — 다음 빌드 때 이 값이 같으면 재요약을 건너뛴다.
 def upsert_community_report(
-    collection: str, community_id: str, level: int, title: str, summary: str, rating: float | None
+    collection: str, community_id: str, level: int, title: str, summary: str,
+    rating: float | None, content_signature: str | None = None,
 ) -> None:
     with get_connection() as conn:
         conn.execute(
             """
             REPLACE INTO community_reports
-                (collection, community_id, level, title, summary, rating, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (collection, community_id, level, title, summary, rating, content_signature, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
-            (collection, community_id, level, title, summary, rating),
+            (collection, community_id, level, title, summary, rating, content_signature),
         )
 
 
@@ -576,7 +583,7 @@ def upsert_community_report(
 def get_community_report(collection: str, community_id: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT collection, community_id, level, title, summary, rating, updated_at "
+            "SELECT collection, community_id, level, title, summary, rating, content_signature, updated_at "
             "FROM community_reports WHERE collection = ? AND community_id = ?",
             (collection, community_id),
         ).fetchone()
@@ -589,7 +596,8 @@ def get_community_report(collection: str, community_id: str) -> dict | None:
         "title": row[3],
         "summary": row[4],
         "rating": row[5],
-        "updated_at": row[6],
+        "content_signature": row[6],
+        "updated_at": row[7],
     }
 
 
@@ -598,13 +606,13 @@ def get_community_reports(collection: str, level: int | None = None) -> list[dic
     with get_connection() as conn:
         if level is None:
             rows = conn.execute(
-                "SELECT collection, community_id, level, title, summary, rating, updated_at "
+                "SELECT collection, community_id, level, title, summary, rating, content_signature, updated_at "
                 "FROM community_reports WHERE collection = ? ORDER BY level, community_id",
                 (collection,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT collection, community_id, level, title, summary, rating, updated_at "
+                "SELECT collection, community_id, level, title, summary, rating, content_signature, updated_at "
                 "FROM community_reports WHERE collection = ? AND level = ? ORDER BY community_id",
                 (collection, level),
             ).fetchall()
@@ -616,7 +624,8 @@ def get_community_reports(collection: str, level: int | None = None) -> list[dic
             "title": r[3],
             "summary": r[4],
             "rating": r[5],
-            "updated_at": r[6],
+            "content_signature": r[6],
+            "updated_at": r[7],
         }
         for r in rows
     ]

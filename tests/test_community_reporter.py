@@ -342,3 +342,70 @@ def test_generate_reports_against_real_claude_cli_smoke():
     print(f"\n[Claude CLI 샘플 리포트] title={report['title']!r}")
     print(f"[Claude CLI 샘플 리포트] summary={report['summary']!r}")
     print(f"[Claude CLI 샘플 리포트] rating={report['rating']!r}")
+
+
+# --- [M5] 증분 재계산: content_signature 기반 재사용 ---
+
+
+def test_generate_reports_reuses_unchanged_reports_on_rebuild(monkeypatch):
+    # 그래프가 그대로면 재빌드 시 LLM 재요약을 하지 않고(추가 콜 0) 기존 리포트를 그대로 재사용한다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    graph_manager.upsert_entity(C, "A", "OTHER", "A 설명")
+    graph_manager.upsert_entity(C, "B", "OTHER", "B 설명")
+    graph_manager.upsert_relation(C, "A", "B", "RELATED_TO", "", "doc1")
+    sqlite_manager.replace_communities(
+        C,
+        [{"community_id": "c1", "level": 0, "parent_community_id": None,
+          "entity_names": ["A", "B"], "size": 2, "graph_signature": "sig"}],
+    )
+    calls = []
+    monkeypatch.setattr(
+        community_reporter, "generate",
+        lambda prompt, backend=None, model=None: calls.append(1) or json.dumps({"title": "T", "summary": "S", "rating": 1}),
+    )
+
+    community_reporter.generate_reports(C)
+    assert len(calls) == 1  # 첫 빌드 = 1콜
+    first = sqlite_manager.get_community_report(C, "c1")
+    assert first["content_signature"]  # 시그니처가 저장됨
+
+    community_reporter.generate_reports(C)  # 그래프 불변 상태로 재빌드
+    assert len(calls) == 1  # 재사용 → 추가 콜 없음
+    second = sqlite_manager.get_community_report(C, "c1")
+    assert (second["title"], second["summary"]) == (first["title"], first["summary"])
+    assert second["content_signature"] == first["content_signature"]
+
+
+def test_generate_reports_regenerates_only_changed_community(monkeypatch):
+    # 한 커뮤니티 멤버의 '설명'만 바뀌어도(멤버십 불변) 그 커뮤니티만 재생성되고 나머지는 재사용된다.
+    # (community_id는 이름만 해시하므로 못 잡는 변화 — content_signature가 잡아야 정확하다.)
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    for name in ["A", "B", "X", "Y"]:
+        graph_manager.upsert_entity(C, name, "OTHER", f"{name} 설명")
+    graph_manager.upsert_relation(C, "A", "B", "RELATED_TO", "", "doc1")
+    graph_manager.upsert_relation(C, "X", "Y", "RELATED_TO", "", "doc1")
+    sqlite_manager.replace_communities(
+        C,
+        [
+            {"community_id": "cAB", "level": 0, "parent_community_id": None,
+             "entity_names": ["A", "B"], "size": 2, "graph_signature": "s"},
+            {"community_id": "cXY", "level": 0, "parent_community_id": None,
+             "entity_names": ["X", "Y"], "size": 2, "graph_signature": "s"},
+        ],
+    )
+    calls = []
+    monkeypatch.setattr(
+        community_reporter, "generate",
+        lambda prompt, backend=None, model=None: calls.append(prompt) or json.dumps({"title": "T", "summary": "S", "rating": 1}),
+    )
+
+    community_reporter.generate_reports(C)
+    assert len(calls) == 2  # 첫 빌드 = 2 커뮤니티 = 2콜
+    calls.clear()
+
+    graph_manager.upsert_entity(C, "A", "OTHER", "A 설명 변경됨")  # cAB 멤버의 설명만 변경
+    community_reporter.generate_reports(C)
+    assert len(calls) == 1  # cAB만 재생성(cXY는 재사용)
+    assert "A 설명 변경됨" in calls[0]  # 재생성된 프롬프트가 cAB의 것
