@@ -12,11 +12,23 @@ from db import graph_manager, sqlite_manager
 logger = logging.getLogger(__name__)
 
 
-# 이름을 비교용 키로 정규화한다 — 공백·구두점·기호를 없애고 소문자로. 한글/영문/숫자만 남긴다.
-# 표기만 다른 같은 대상("연료전지 시스템"/"연료전지시스템")을 같은 키로 모으되,
+# 이름 끝에 붙은 한국어 조사(주격 이/가, 보조사 은/는, 목적격 을/를 등)를 떼어 같은 대상의 표기 변형을
+# 합칠 수 있게 한다. 예: "길동이" -> "길동"(서술 중 "길동이가"처럼 이름에 조사가 눌어붙는 한국어 서사 특유의
+# 파편화 대응). 이름 자체가 조사 글자로 끝나는 짧은 이름("순이" 등)의 오삭제를 막으려 3글자 이상만 처리한다.
+_KOREAN_JOSA = ("이", "가", "은", "는", "을", "를", "과", "와")
+
+
+def strip_trailing_josa(name: str) -> str:
+    if len(name) > 2 and name[-1] in _KOREAN_JOSA:
+        return name[:-1]
+    return name
+
+
+# 이름을 비교용 키로 정규화한다 — 끝 조사 제거 후 공백·구두점·기호를 없애고 소문자로. 한글/영문/숫자만 남긴다.
+# 표기만 다른 같은 대상("연료전지 시스템"/"연료전지시스템", "길동"/"길동이")을 같은 키로 모으되,
 # 구성 문자 자체가 다른 것("GC/FID"≠"GC/FID/TCD")은 키가 달라 섞이지 않는다(안전한 무료 병합).
 def _normalize_name(name: str) -> str:
-    return re.sub(r"[\s\W_]+", "", name, flags=re.UNICODE).lower()
+    return re.sub(r"[\s\W_]+", "", strip_trailing_josa(name), flags=re.UNICODE).lower()
 
 
 # 한 컬렉션(사업) 안의 엔티티만 둘러보며 유사도 임계값을 넘는 병합 후보 쌍을 찾는다.

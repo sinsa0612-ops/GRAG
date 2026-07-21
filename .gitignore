@@ -21,3 +21,12 @@ qa_result.txt
 # 구글 드라이브 동기화 임시 폴더
 .tmp.drivedownload/
 .tmp.driveupload/
+
+# 내부 개발/AI 오케스트레이션 문서 — 소프트웨어가 아니라 개발 과정 기록이라 공개 repo에는 두지 않는다.
+# (로컬에는 남아 연속성 유지: AI 에이전트 지침·핸드오프 로그·세션별 계획/검증서)
+AI-INSTRUCTIONS.md
+CLAUDE.md
+HANDOFF-main.md
+HANDOFF-sub.md
+walkthrough.md
+implementation_plan.md

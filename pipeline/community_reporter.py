@@ -12,6 +12,8 @@
 import hashlib
 import json
 import logging
+import os
+from collections import Counter
 
 from adapters.llm_adapter import generate
 from config import settings
@@ -23,12 +25,15 @@ logger = logging.getLogger(__name__)
 # [M5] 리프 커뮤니티의 '리포트 입력'(멤버 이름+설명, 내부 관계, 외부 연결)을 해시해 content_signature를 만든다.
 # 프롬프트에 실제로 들어가는 것과 동일한 입력이라, 이 값이 같으면 리포트도 같아야 하므로 재요약을 건너뛸 수 있다.
 # (community_id는 멤버 '이름'만 해시해 설명·관계 변화를 못 잡으므로, 재사용 판정엔 이 시그니처를 써야 안전하다.)
-def _leaf_signature(entities: list[dict], relations: list[dict], external_relations: list[dict]) -> str:
+def _leaf_signature(
+    entities: list[dict], relations: list[dict], external_relations: list[dict], source_hint: str = ""
+) -> str:
     payload = json.dumps(
         {
             "members": sorted([e["name"], e.get("description") or ""] for e in entities),
             "internal": sorted(f"{r['source']}|{r['predicate']}|{r['target']}" for r in relations),
             "external": sorted(f"{r['source']}|{r['predicate']}|{r['target']}" for r in external_relations),
+            "source": source_hint or "",  # 출처가 바뀌면(같은 관계라도) 리포트가 달라지므로 시그니처에 포함
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -36,10 +41,13 @@ def _leaf_signature(entities: list[dict], relations: list[dict], external_relati
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-# [M5] 상위 커뮤니티의 시그니처 — 자식들의 시그니처 집합을 해시한다. 자식이 하나라도 바뀌면(시그니처 변화)
+# [M5] 상위 커뮤니티의 시그니처 — 자식들의 시그니처 집합 + 출처를 해시한다. 자식이 하나라도 바뀌면(시그니처 변화)
 # 이 값도 바뀌어 상위 리포트가 재생성되고, 자식이 모두 그대로면 상위도 재사용된다(정확한 계층 전파).
-def _parent_signature(child_signatures: list[str]) -> str:
-    payload = json.dumps({"children": sorted(child_signatures)}, ensure_ascii=False, sort_keys=True)
+def _parent_signature(child_signatures: list[str], source_hint: str = "") -> str:
+    payload = json.dumps(
+        {"children": sorted(child_signatures), "source": source_hint or ""},
+        ensure_ascii=False, sort_keys=True,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 # 도메인·언어 중립 프롬프트(spec-addendum §B) — 업종 어휘("사업" 등)나 특정 언어를 가정하지 않고,
@@ -56,7 +64,7 @@ _LEAF_PROMPT = """\
 
 이 커뮤니티가 바깥 항목과 맺는 연결(다른 그룹으로 이어지는 관계):
 {external_links}
-
+{source_block}
 summary에는 이 커뮤니티의 핵심 내용을 담되, 위 '바깥 항목과 맺는 연결'이 있으면 이 커뮤니티가
 다른 그룹과 어떻게 이어지는지도 함께 밝혀줘(없으면 생략).
 다음 JSON 형식으로만 응답해줘(다른 설명이나 머리말 없이 순수 JSON만):
@@ -69,17 +77,40 @@ _PARENT_PROMPT = """\
 
 하위 커뮤니티 리포트들:
 {child_reports}
-
+{source_block}
 다음 JSON 형식으로만 응답해줘(다른 설명이나 머리말 없이 순수 JSON만):
 {{"title": "이 상위 커뮤니티를 대표하는 짧은 제목", "summary": "하위 리포트들을 종합한 문단", "rating": 0에서 10 사이 숫자(이 커뮤니티가 얼마나 중요/핵심적인지)}}
 """
+
+
+# 커뮤니티 내부 관계들의 source_doc(=source_id) 최빈값을 파일명(확장자 제거)으로 바꿔 '대표 출처'를 정한다.
+# 관계가 없으면(고립 커뮤니티) 빈 문자열. 이 라벨이 리포트에 실려야 "각 문서별로" 글로벌 질문이 가능해진다.
+def _dominant_source_label(relations: list[dict], source_names: dict[str, str]) -> str:
+    ids = [r.get("source_doc") for r in relations if r.get("source_doc")]
+    if not ids:
+        return ""
+    top_id, _ = Counter(ids).most_common(1)[0]
+    file_name = source_names.get(top_id, "")
+    return os.path.splitext(file_name)[0] if file_name else ""
+
+
+# 출처 문서 힌트를 프롬프트 블록으로 만든다 — summary에 '어느 문서(소설)에서 나왔는지'를 밝히게 유도한다.
+# 이게 있어야 단일 컬렉션에서도 글로벌 검색이 "각 문서별로" 질문에 답할 수 있다(리포트가 출처를 담으므로).
+def _source_block(source_hint: str | None) -> str:
+    if not source_hint:
+        return ""
+    return (
+        f"\n이 커뮤니티의 항목들은 주로 '{source_hint}'(출처 문서)에서 나왔다. "
+        f"summary 첫머리에 이 출처를 자연스럽게 밝혀라(예: \"{source_hint}에서는 …\").\n"
+    )
 
 
 # 리프 커뮤니티 프롬프트를 만든다 — 멤버 엔티티(이름+설명)와 그 사이 내부 관계, 그리고 커뮤니티 경계를
 # 넘는 외부 연결(다른 커뮤니티로 이어지는 관계)을 각각 번호 없는 목록으로 넣는다. 외부 연결이 있어야
 # 글로벌 검색이 "그룹 간 연결" 질문에 답할 수 있다(리프 리포트에 교차 엣지가 담기므로).
 def _build_leaf_prompt(
-    entities: list[dict], relations: list[dict], external_relations: list[dict] | None = None
+    entities: list[dict], relations: list[dict], external_relations: list[dict] | None = None,
+    source_hint: str | None = None,
 ) -> str:
     members = "\n".join(f"- {e['name']}: {e.get('description') or '(설명 없음)'}" for e in entities)
     if relations:
@@ -95,16 +126,17 @@ def _build_leaf_prompt(
     else:
         ext_lines = "(바깥으로 이어지는 관계 없음)"
     return _LEAF_PROMPT.format(
-        members=members or "(항목 없음)", relations=rel_lines, external_links=ext_lines
+        members=members or "(항목 없음)", relations=rel_lines, external_links=ext_lines,
+        source_block=_source_block(source_hint),
     )
 
 
 # 상위 레벨 커뮤니티 프롬프트를 만든다 — 이미 생성된 자식 커뮤니티 리포트(title+summary)를 재료로 넣는다.
-def _build_parent_prompt(child_reports: list[dict]) -> str:
+def _build_parent_prompt(child_reports: list[dict], source_hint: str | None = None) -> str:
     numbered = "\n\n".join(
         f"{i}. [{c['title']}] {c['summary']}" for i, c in enumerate(child_reports, start=1)
     )
-    return _PARENT_PROMPT.format(child_reports=numbered)
+    return _PARENT_PROMPT.format(child_reports=numbered, source_block=_source_block(source_hint))
 
 
 # LLM 원시 응답에서 title/summary/rating을 방어적으로 파싱한다(구조화 출력을 강제할 수 없는 ollama/CLI
@@ -148,6 +180,8 @@ def generate_reports(collection: str, model: str | None = None) -> int:
 
     entities_by_name = {e["name"]: e for e in graph_manager.get_all_entities([collection])}
     relations = graph_manager.get_all_relations([collection])
+    source_names = sqlite_manager.get_source_doc_names(collection)  # source_id -> file_name
+    comm_sources: dict[str, str] = {}  # community_id -> 대표 출처 라벨(상위 계산용)
 
     children_of: dict[str, list[str]] = {}
     for community in communities:
@@ -173,8 +207,10 @@ def generate_reports(collection: str, model: str | None = None) -> int:
                     "[%s] 커뮤니티 %s: 자식 리포트가 모두 실패해 건너뜀", collection, community_id
                 )
                 continue
-            signature = _parent_signature([r["content_signature"] for r in child_reports])
-            prompt = _build_parent_prompt(child_reports)
+            # 상위 출처 = 자식들의 대표 출처 합집합(예: "봄봄, 동백꽃").
+            source_hint = ", ".join(sorted({comm_sources[cid] for cid in child_ids if comm_sources.get(cid)}))
+            signature = _parent_signature([r["content_signature"] for r in child_reports], source_hint)
+            prompt = _build_parent_prompt(child_reports, source_hint)
         else:
             member_names = set(community["entity_names"])
             members = [
@@ -189,10 +225,13 @@ def generate_reports(collection: str, model: str | None = None) -> int:
                 r for r in relations
                 if (r["source"] in member_names) != (r["target"] in member_names)
             ][: settings.community_report_external_max]
-            signature = _leaf_signature(members, member_relations, external_relations)
-            prompt = _build_leaf_prompt(members, member_relations, external_relations)
+            # 대표 출처(어느 문서에서 왔나) — 리포트에 실어 "각 문서별로" 글로벌 질문에 답할 수 있게 한다.
+            source_hint = _dominant_source_label(member_relations, source_names)
+            signature = _leaf_signature(members, member_relations, external_relations, source_hint)
+            prompt = _build_leaf_prompt(members, member_relations, external_relations, source_hint)
 
         signatures[community_id] = signature
+        comm_sources[community_id] = source_hint
 
         # [M5] 시그니처가 직전 빌드와 같으면 LLM 없이 기존 리포트를 재사용한다.
         prev = existing.get(community_id)

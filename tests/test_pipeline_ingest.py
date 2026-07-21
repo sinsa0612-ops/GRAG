@@ -244,6 +244,24 @@ def test_resolve_canonical_name_keeps_genuinely_new_name():
     assert resolved == "처음 보는 엔티티"
 
 
+def test_resolve_canonical_name_merges_josa_variant_at_index_time():
+    # [한국어] 인덱싱 시점에 바로: 이미 "길동"이 있으면 조사 붙은 "길동이"는 새 노드 대신 "길동"으로 합친다.
+    graph_manager.init_schema()
+    graph_manager.upsert_entity(C, "길동", "PERSON", "홍길동전 주인공")
+
+    resolved = ingest._resolve_canonical_name(C, "길동이")
+
+    assert resolved == "길동"
+    assert graph_manager.find_canonical_name(C, "길동이") == "길동"  # alias로 등록돼 이후에도 합쳐짐
+
+
+def test_resolve_canonical_name_josa_only_merges_into_existing():
+    # 조사 뗀 형태가 그래프에 없으면 원 표기를 그대로 신규 저장한다(짧은/새 이름 오병합 방지).
+    graph_manager.init_schema()
+    resolved = ingest._resolve_canonical_name(C, "길동이")  # "길동"이 아직 없음
+    assert resolved == "길동이"
+
+
 def test_store_extraction_merges_known_alias_instead_of_creating_new_node():
     graph_manager.init_schema()
     sqlite_manager.init_schema()  # [M1.5] store_extraction이 설명 후보도 sqlite에 병행 적재하므로 필요
