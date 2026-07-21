@@ -40,6 +40,26 @@ def test_build_leaf_prompt_handles_no_relations():
     assert "(바깥으로 이어지는 관계 없음)" in prompt  # 외부 연결 미지정 시 안내
 
 
+def test_dominant_source_label_picks_mode_and_strips_extension():
+    # 커뮤니티 내부 관계의 source_doc 최빈값을 파일명(확장자 제거)으로 돌려준다.
+    relations = [{"source_doc": "id1"}, {"source_doc": "id1"}, {"source_doc": "id2"}]
+    names = {"id1": "봄봄.md", "id2": "동백꽃.md"}
+    assert community_reporter._dominant_source_label(relations, names) == "봄봄"
+    # 관계가 없으면(고립) 빈 문자열.
+    assert community_reporter._dominant_source_label([], names) == ""
+
+
+def test_build_leaf_prompt_includes_source_hint():
+    # 출처 힌트가 있으면 프롬프트가 summary에 출처를 밝히도록 유도한다(단일 컬렉션 '각 문서별로' 질문 대응).
+    prompt = community_reporter._build_leaf_prompt(
+        [{"name": "점순", "description": ""}], [], None, source_hint="봄봄"
+    )
+    assert "봄봄" in prompt
+    # 힌트가 없으면 출처 블록이 붙지 않는다.
+    prompt_no = community_reporter._build_leaf_prompt([{"name": "A", "description": ""}], [])
+    assert "출처 문서" not in prompt_no
+
+
 def test_build_leaf_prompt_includes_external_links():
     # 커뮤니티 경계를 넘는 관계(외부 연결)가 프롬프트에 담겨야 글로벌 검색이 그룹 간 연결을 답할 수 있다.
     entities = [{"name": "A", "description": "내부"}]

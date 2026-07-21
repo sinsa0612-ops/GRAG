@@ -208,6 +208,16 @@ def get_document_source_id(collection: str, file_name: str) -> str | None:
     return row[0] if row else None
 
 
+# 컬렉션의 source_id -> file_name 매핑을 통째로 돌려준다([M3+] 리포트에 '출처 문서'를 표기해,
+# 단일 컬렉션에서도 "각 문서별로" 글로벌 질문에 답할 수 있게 하는 데 쓴다).
+def get_source_doc_names(collection: str) -> dict[str, str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT source_id, file_name FROM documents WHERE collection = ?", (collection,)
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 # 문서 레코드를 새로 쓰거나 갱신한다.
 # (collection, file_name)이 UNIQUE라, 같은 파일을 새 source_id로 다시 넣으면 옛 행이 자동 교체된다(유령 행 없음).
 def upsert_document(
