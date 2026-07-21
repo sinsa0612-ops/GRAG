@@ -129,6 +129,18 @@ def test_normalize_name_collapses_spacing_and_symbols():
     )
 
 
+def test_strip_trailing_josa_collapses_particle_but_protects_short_names():
+    # 3글자 이상 이름 끝 조사는 떼고(길동이->길동), 2글자 짧은 이름은 오삭제하지 않는다(순이->순이).
+    assert entity_resolution.strip_trailing_josa("길동이") == "길동"
+    assert entity_resolution.strip_trailing_josa("홍길동이") == "홍길동"
+    assert entity_resolution.strip_trailing_josa("점순이") == "점순"
+    assert entity_resolution.strip_trailing_josa("순이") == "순이"  # 2글자 보호
+    assert entity_resolution.strip_trailing_josa("감자") == "감자"  # 조사 아님
+    # 정규화 키도 조사 변형을 같은 키로 모은다(길동/길동이는 병합, 성 붙은 홍길동은 별개).
+    assert entity_resolution._normalize_name("길동이") == entity_resolution._normalize_name("길동")
+    assert entity_resolution._normalize_name("홍길동") != entity_resolution._normalize_name("길동")
+
+
 def test_find_normalized_duplicates_groups_spacing_variants():
     graph_manager.init_schema()
     sqlite_manager.init_schema()

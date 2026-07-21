@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from adapters.llm_adapter import generate
 from config import settings
 from db import document_store, graph_manager, sqlite_manager, vector_manager
+from pipeline import entity_resolution
 from schemas import EntityType, ExtractionResult
 
 logger = logging.getLogger(__name__)
@@ -238,11 +239,20 @@ def glean_chunk(
 # 일치하는 게 alias 매칭이었다면(이름 자체와는 다름) 그 사실을 alias로 기록해둔다.
 def _resolve_canonical_name(collection: str, name: str) -> str:
     canonical = graph_manager.find_canonical_name(collection, name)
-    if canonical is None:
-        return name
-    if canonical != name:
-        graph_manager.add_alias(collection, canonical, name)
-    return canonical
+    if canonical is not None:
+        if canonical != name:
+            graph_manager.add_alias(collection, canonical, name)
+        return canonical
+    # [한국어] 인덱싱 시점에 바로 합친다 — 조사가 눌어붙은 표기("길동이")면 조사를 뗀 형태("길동")가 이미
+    # 그래프에 있는지 재확인해, 있으면 그 캐노니컬로 합치고 원 표기는 alias로 남긴다(기존에 있는 이름으로만
+    # 합치므로 짧은 이름을 잘못 만들어낼 위험 없음). 없으면 원래 이름 그대로 신규 저장.
+    stripped = entity_resolution.strip_trailing_josa(name)
+    if stripped != name:
+        canonical = graph_manager.find_canonical_name(collection, stripped)
+        if canonical is not None:
+            graph_manager.add_alias(collection, canonical, name)
+            return canonical
+    return name
 
 
 # 검증된 추출 결과를 해당 컬렉션의 그래프 DB에 반영한다. 엔티티/관계 이름은 저장 전 캐노니컬 이름으로 정규화한다.
