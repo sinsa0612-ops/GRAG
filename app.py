@@ -240,12 +240,13 @@ def _run_ingest_inbox(
 
 
 # 문서 추출+그래프 생성(ingest) 탭 — 업로드/inbox, 예상 요청 수·한도 가드, force/no-merge 옵션.
-# GUI 백엔드 라벨 → process_file backend 인자. "Gemini(기본)"은 None으로 넘겨 기존 hot-path와 100% 동일하게 둔다.
+# GUI 백엔드 라벨 → process_file backend 인자. 완전 로컬이 기본이라 Ollama를 맨 앞(기본 선택)에 둔다.
+# Gemini는 "None"으로 넘겨 기존 Gemini 경로와 100% 동일하게 동작한다(외부 업로드 — 옵트인).
 _INGEST_BACKENDS = {
-    "Gemini (기본)": None,
-    "Ollama (로컬 무료)": "ollama",
-    "Claude CLI (구독)": "claude_cli",
-    "Codex CLI (구독)": "codex_cli",
+    "Ollama (로컬·기본)": "ollama",
+    "Gemini (외부·키 필요)": None,
+    "Claude CLI (외부·구독)": "claude_cli",
+    "Codex CLI (외부·구독)": "codex_cli",
 }
 
 
@@ -253,7 +254,7 @@ def render_ingest_tab() -> None:
     collection = _pick_collection("ingest")
     backend_label = st.selectbox(
         "추출 백엔드", list(_INGEST_BACKENDS), key="ingest_backend",
-        help="Gemini=하루 한도(RPD) 적용. Ollama=로컬 무료(느리지만 무제한). Claude/Codex CLI=구독.",
+        help="Ollama=로컬 무료·데이터 외부로 안 나감(기본). Gemini/Claude/Codex=외부로 전송(빠르지만 업로드됨).",
     )
     backend = _INGEST_BACKENDS[backend_label]
     is_gemini = backend in (None, "gemini")
