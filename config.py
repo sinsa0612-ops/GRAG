@@ -84,8 +84,9 @@ class Settings(BaseSettings):
     # 대량 배치(하위/중간 레벨) 리포트 생성 기본 백엔드. 무료·무제한이라 수백 콜도 부담 없다.
     # Gemini는 폐기하지 않고(CEO 지시) 이 값을 "gemini"로 바꿔 선택할 수 있게 열어둔다.
     community_report_bulk_backend: str = "ollama"
-    # 최상위 레벨(소수·고가치) 리포트 생성 기본 백엔드. 재빌드당 몇십 콜 수준이라 쿼터 부담이 적다.
-    community_report_top_backend: str = "claude_cli"
+    # 최상위 레벨(소수·고가치) 리포트 생성 기본 백엔드. 완전 로컬(외부 업로드 금지)이 기본이라 ollama로 둔다.
+    # 최상위 요약을 Claude 품질로 원하고 그 데이터를 Anthropic에 보내도 되면 "claude_cli"로 옵트인한다.
+    community_report_top_backend: str = "ollama"
     # 레벨 0(최상위)부터 이 개수만큼의 레벨을 top 백엔드로, 나머지(대량)는 bulk 백엔드로 라우팅한다.
     report_cli_top_levels: int = 1
 
@@ -104,6 +105,12 @@ class Settings(BaseSettings):
     # 완전 로컬(무과금) 운영이 이 프로젝트의 기본이라 ollama로 둔다. Gemini 키가 있고 flash-lite 합성을
     # 원하면 .env에서 ANSWER_BACKEND=gemini로 되돌린다(그때만 RPD 한도에 잡힌다). query --backend로 질의별 오버라이드 가능.
     answer_backend: str = "ollama"
+
+    # --- 인제스트(추출) 기본 백엔드 ---
+    # 외부 업로드 금지(완전 로컬)가 기본이라 ollama. 데이터를 Gemini로 보내도 되면 .env에서 INGEST_BACKEND=gemini로
+    # 바꾸거나 `graphrag ingest --backend gemini`로 건별 옵트인(그때만 RPD 한도 적용). 이렇게 두면 아무 플래그 없이
+    # `graphrag ingest`가 로컬로 안전하게 돈다(실수로 외부에 나가지 않음).
+    ingest_backend: str = "ollama"
 
     @property
     # SQLite 마스터 DB 파일 경로를 계산한다.

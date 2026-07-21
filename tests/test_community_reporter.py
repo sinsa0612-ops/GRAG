@@ -99,7 +99,7 @@ def test_parse_report_invalid_json_raises():
 
 
 def test_backend_for_level_routes_top_vs_bulk_by_default():
-    # 기본 report_cli_top_levels=1 -> 레벨 0만 top(claude_cli), 레벨 1 이상은 bulk(ollama).
+    # 기본 report_cli_top_levels=1 -> 레벨 0만 top(기본 ollama), 레벨 1 이상은 bulk(ollama).
     assert community_reporter._backend_for_level(0) == settings.community_report_top_backend
     assert community_reporter._backend_for_level(1) == settings.community_report_bulk_backend
     assert community_reporter._backend_for_level(2) == settings.community_report_bulk_backend
@@ -168,8 +168,8 @@ def test_generate_reports_bottom_up_uses_child_reports_as_material(monkeypatch):
     n = community_reporter.generate_reports(C)
 
     assert n == 3
-    # 자식(레벨1, 2개) 먼저 -> 둘 다 bulk(ollama), 부모(레벨0) 나중 -> top(claude_cli).
-    assert [c["backend"] for c in calls] == ["ollama", "ollama", "claude_cli"]
+    # 자식(레벨1, 2개) 먼저 -> 둘 다 bulk(ollama), 부모(레벨0) 나중 -> top(기본 ollama, 완전 로컬).
+    assert [c["backend"] for c in calls] == ["ollama", "ollama", "ollama"]
     assert "A" in calls[0]["prompt"] and "B" in calls[0]["prompt"]
     assert "C_" in calls[1]["prompt"] and "D" in calls[1]["prompt"]
 

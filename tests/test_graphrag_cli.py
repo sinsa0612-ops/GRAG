@@ -80,12 +80,12 @@ def test_cli_ingest_backend_flag_threads_to_process_file(tmp_path, monkeypatch):
     memo = tmp_path / "memo.md"
     memo.write_text("아무 메모", encoding="utf-8")
 
-    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A", "--backend", "ollama"])
-    assert seen["backend"] == "ollama"
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A", "--backend", "gemini"])
+    assert seen["backend"] == "gemini"
 
     memo.write_text("아무 메모2", encoding="utf-8")  # 해시가 달라야 재처리됨
     graphrag_cli.main(["ingest", str(memo), "--collection", "사업A"])
-    assert seen["backend"] is None  # 플래그 없으면 기본 Gemini 경로
+    assert seen["backend"] == "ollama"  # 플래그 없으면 설정 기본값(ingest_backend=ollama, 완전 로컬)
 
 
 def test_cli_delete_collection_clears_it(tmp_path, monkeypatch, capsys):
@@ -144,7 +144,8 @@ def test_cli_ingest_blocks_when_over_daily_limit(tmp_path, monkeypatch, capsys):
     memo = tmp_path / "big.md"
     memo.write_text("가" * 25, encoding="utf-8")  # 3청크 > 한도 2
 
-    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A"])
+    # 한도 가드는 Gemini 백엔드에만 적용된다(기본은 로컬 ollama라 한도 무관) → 명시적으로 gemini로 테스트.
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A", "--backend", "gemini"])
 
     out = capsys.readouterr().out
     assert "한도 초과" in out

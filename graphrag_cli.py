@@ -98,7 +98,8 @@ def cmd_ingest(args) -> None:
     import process_inbox
 
     collection = args.collection or settings.default_collection
-    backend = getattr(args, "backend", None)
+    # --backend 미지정이면 설정 기본값(ingest_backend, 기본 ollama = 완전 로컬). 명시하면 그걸 우선한다.
+    backend = getattr(args, "backend", None) or settings.ingest_backend
     # ollama(로컬 무료)·claude_cli/codex_cli(구독)는 Gemini 일일 한도(RPD)와 무관 → 한도 가드/사용량 기록을 건너뛴다.
     _is_gemini = backend in (None, "gemini")
     if not _is_gemini:
