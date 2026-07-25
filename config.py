@@ -101,6 +101,16 @@ class Settings(BaseSettings):
     # 리프 리포트에 담을 '외부 연결'(커뮤니티 경계를 넘는 관계) 최대 개수 — 프롬프트 폭주 방지 상한.
     community_report_external_max: int = 20
 
+    # --- 글로벌 검색 재설계(신뢰성) 설정 ---
+    # 서브질문별로 MAP에 강제 투입할 상위 리포트 개수(임베딩 랭킹 상위 K). 클수록 recall↑·MAP 콜↑.
+    global_search_top_k: int = 5
+    # top-K의 하한 — 랭킹이 부정확해도 최소 이만큼은 MAP에 넣어 "재료 0" 실패를 원천 차단(리포트가 이보다 적으면 전량).
+    global_search_min_reports: int = 3
+    # 복합질문 결정적 분해 시 총 서브질문 최대 개수(원질문 포함). MAP 콜 폭주를 막는 상한.
+    global_search_max_subqueries: int = 4
+    # 글로벌 MAP LLM 호출 temperature. 0=그리디(결정적) — 같은 질문·같은 리포트가 실행마다 같은 추출을 내도록 고정.
+    global_search_map_temperature: float = 0.0
+
     # --- 로컬 질의(answer_question) 답변 합성 백엔드 ---
     # 완전 로컬(무과금) 운영이 이 프로젝트의 기본이라 ollama로 둔다. Gemini 키가 있고 flash-lite 합성을
     # 원하면 .env에서 ANSWER_BACKEND=gemini로 되돌린다(그때만 RPD 한도에 잡힌다). query --backend로 질의별 오버라이드 가능.

@@ -20,13 +20,25 @@ class LocalLLMError(RuntimeError):
 # 요청한도 보호용 재시도/대기 로직이 필요 없다. 연결 실패·타임아웃·빈 응답은 모두 LocalLLMError로
 # 감싸 원인을 명확히 알린다(response_schema는 구조화 출력 강제가 불가해 지원하지 않음 — 호출부가
 # 기존 Gemma 대응과 동형으로 원문을 방어적 파싱한다).
-def generate(prompt: str, model: str | None = None) -> str:
+# [M4] temperature/format_json은 선택 파라미터(기본 None/False)다 — 미전달 시 payload가 기존과 완전히
+# 동일(바이트 동일)하게 유지되어 기존 호출부(ingest/reporter/answer_question)는 영향이 없다. 글로벌 MAP처럼
+# 결정적 JSON 출력이 필요할 때만 옵트인한다.
+def generate(
+    prompt: str,
+    model: str | None = None,
+    temperature: float | None = None,
+    format_json: bool = False,
+) -> str:
     model = model or settings.ollama_model_name
     url = f"{settings.ollama_base_url}/api/generate"
     # think=False: qwen3 계열의 추론(<think> 체인)을 꺼 추출·요약을 빠르고 깨끗한 직답으로 받는다.
     # (추론이 켜지면 추출처럼 긴 프롬프트는 청크당 120초 타임아웃 — 이 파이프라인은 로컬 모델의
     #  사고연쇄가 불필요하고, <think> 태그가 방어적 JSON 파서를 오염시킬 수도 있다.)
     payload = {"model": model, "prompt": prompt, "stream": False, "think": False}
+    if temperature is not None:
+        payload["options"] = {"temperature": temperature}
+    if format_json:
+        payload["format"] = "json"
 
     try:
         response = requests.post(url, json=payload, timeout=settings.ollama_request_timeout_sec)

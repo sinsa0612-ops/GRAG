@@ -121,7 +121,7 @@ def test_generate_routes_ollama_backend_to_local_llm_adapter(monkeypatch):
 
     calls = {}
 
-    def fake_ollama_generate(prompt, model=None):
+    def fake_ollama_generate(prompt, model=None, temperature=None, format_json=False):
         calls["prompt"] = prompt
         calls["model"] = model
         return "ollama 응답"

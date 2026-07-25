@@ -54,16 +54,20 @@ def _request_interval(model: str) -> float:
 # (구조화 출력 강제 불가) 무시하고, 호출부가 기존 Gemma 대응과 동형으로 원문을 방어적 파싱한다.
 # 어댑터 모듈은 실제로 그 backend가 쓰일 때만 import한다(불필요한 의존 로드를 피하고, 한 백엔드의
 # import 실패가 다른 백엔드/기본 경로에 영향을 주지 않게 한다).
+# [M4] temperature/format_json은 ollama 브랜치에만 전달한다(글로벌 MAP의 결정적 JSON 출력용).
+# gemini/claude_cli/codex_cli 브랜치는 두 인자를 무시한다 — ollama 전용, 타 백엔드는 지원 범위 밖.
 def generate(
     prompt: str,
     response_schema: type | None = None,
     model: str | None = None,
     backend: str | None = None,
+    temperature: float | None = None,
+    format_json: bool = False,
 ) -> str:
     if backend == "ollama":
         from adapters.local_llm_adapter import generate as _ollama_generate
 
-        return _ollama_generate(prompt, model=model)
+        return _ollama_generate(prompt, model=model, temperature=temperature, format_json=format_json)
     if backend in ("claude_cli", "codex_cli"):
         from adapters.cli_llm_adapter import generate as _cli_generate
 

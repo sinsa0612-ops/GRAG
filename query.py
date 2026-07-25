@@ -5,9 +5,13 @@
 import json
 import logging
 
+import numpy as np
+
+from adapters.embedding_adapter import embed_texts
 from adapters.llm_adapter import generate
 from config import settings
 from db import graph_manager, sqlite_manager, vector_manager
+from schemas import MapEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +140,15 @@ def answer_question(
 # 도메인·언어 중립 프롬프트(spec-addendum §B) — community_reporter.py의 프롬프트와 동일한 톤으로,
 # 업종 어휘를 가정하지 않고 입력(리포트/부분답변)에 쓰인 언어를 그대로 따라가도록 유도한다.
 
+# [글로벌 검색 재설계 — 신뢰성] 리포트 선별을 LLM 채점(비결정적 관문)에서 결정적 임베딩 랭킹으로
+# 바꿨다 — 상위 K개(하한 settings.global_search_min_reports)는 무조건 MAP에 투입해 "재료 0" 실패
+# 클래스를 원천 차단한다(강제 admission). MAP도 "관련도 채점"이 아니라 "근거 포인트 추출"로 바꿔
+# 빈 배열=무관을 자연히 내장했다. 복합질문("A·B·C 각각")은 LLM 없이 코드로 결정적 분해해 서브질문마다
+# 독립적으로 랭킹·MAP한다(한 서브질문이 다른 서브질문의 리포트를 밀어내지 않도록).
+
 _MAP_PROMPT = """\
-아래는 어떤 자료 묶음(커뮤니티)을 요약한 리포트다. 이 리포트가 다음 질문에 답하는 데 도움이 되는지 판단해줘.
-리포트에 쓰인 언어를 그대로 사용해서 답해.
+아래는 어떤 자료 묶음(커뮤니티)을 요약한 리포트다. 이 리포트에서 다음 질문에 답이 되는 근거 포인트만 뽑아줘.
+관련 내용이 없으면 빈 배열을 반환해. 리포트에 없는 내용은 지어내지 말고, 리포트에 쓰인 언어를 그대로 사용해.
 
 리포트 제목: {title}
 리포트 요약: {summary}
@@ -146,19 +156,21 @@ _MAP_PROMPT = """\
 질문: {question}
 
 다음 JSON 형식으로만 응답해줘(다른 설명이나 머리말 없이 순수 JSON만):
-{{"relevance": 이 리포트가 질문에 얼마나 도움되는지 나타내는 0에서 10 사이 정수(전혀 관련 없으면 0), "partial_answer": "이 리포트만 근거로 한 부분 답변(관련 없으면 빈 문자열)"}}
+{{"evidence_points": ["근거 포인트1", "근거 포인트2", ...]}}
 """
 
 _REDUCE_PROMPT = """\
-아래는 하나의 질문에 대해 서로 다른 자료 묶음(커뮤니티)에서 나온 부분 답변들이다(관련도 높은 순으로 나열).
-이 부분 답변들을 종합해 질문에 대한 하나의 완결된 답변을 작성해줘. 부분 답변에 쓰인 언어를 그대로 사용해서 답해.
+아래는 하나의 질문을 서브질문들로 나누어, 서로 다른 자료 묶음(커뮤니티)에서 뽑아낸 근거 포인트들이다.
+각 블록은 [서브질문|출처] 형식으로 어느 서브질문·어느 자료에서 나왔는지 표시되어 있다.
+이 근거들을 종합해 아래 질문에 대한 하나의 완결된 답변을 작성해줘. 근거에 없는 내용은 지어내지 말고,
+가능하면 어떤 서브질문·출처에 근거했는지 답변에 드러나게 해줘. 근거에 쓰인 언어를 그대로 사용해.
 
 질문: {question}
 
-부분 답변들(관련도 높은 순):
-{partial_answers}
+근거 포인트들:
+{evidence_blocks}
 
-위 부분 답변들을 종합한 최종 답변만 작성해줘(다른 설명이나 머리말 없이 답변 본문만).
+위 근거들을 종합한 최종 답변만 작성해줘(다른 설명이나 머리말 없이 답변 본문만).
 """
 
 # 스코프에 리포트가 아예 없을 때(커뮤니티가 한 번도 안 빌드됨) 돌려주는 안내 문자열 — CLI/GUI가 별도
@@ -167,8 +179,12 @@ _NO_REPORTS_MESSAGE = (
     "이 범위에는 아직 커뮤니티 리포트가 없습니다. "
     "먼저 `graphrag communities build --collection <이름>`을 실행하세요."
 )
-# 리포트는 있지만(빌드는 됨) MAP 결과가 전부 관련도 0(또는 파싱 실패)이라 종합할 부분답변이 없을 때.
+# 리포트는 있지만(빌드는 됨) 모든 서브질문·리포트에서 근거 포인트를 하나도 못 찾아 종합할 재료가 없을 때.
 _NO_RELEVANT_MESSAGE = "이 범위의 커뮤니티 리포트 중 질문과 관련된 내용을 찾지 못했습니다."
+
+# 복합질문 분해에 쓰는 열거형 구분자 화이트리스트. 쉼표(,)와 '와/과'는 일부러 뺐다 — 쉼표는 노이즈가
+# 크고(문장 중간에도 흔함), '와/과'는 "A와 B의 관계"처럼 관계형 질문을 잘못 쪼갤 위험이 커서다.
+_DECOMPOSE_DELIMITERS = ("·", "、", " 및 ", " 그리고 ")
 
 
 # collections가 None이면(--all) 문서·그래프 어느 쪽에든 존재가 확인된 모든 컬렉션을 대상으로 한다
@@ -191,50 +207,110 @@ def _collect_global_reports(collections: list[str], level: int) -> list[dict]:
     return reports
 
 
-# MAP 단계 LLM 원시 응답에서 relevance/partial_answer를 방어적으로 파싱한다
-# (community_reporter._parse_report와 동형 — 코드펜스 제거 후 json.loads). relevance는 정수로
-# 강제하고 음수는 0으로 clamp한다(파싱 실패는 예외로 알려 호출부가 그 리포트만 건너뛰게 한다).
-def _parse_map_response(raw_text: str) -> dict:
-    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-    data = json.loads(cleaned)
-    relevance = max(0, int(data.get("relevance") or 0))
-    partial_answer = str(data.get("partial_answer") or "").strip()
-    return {"relevance": relevance, "partial_answer": partial_answer}
+# 복합질문을 열거형 구분자로만 분리하는 순수 함수(LLM 미사용, 완전 결정적). 정규식 대신 단순 치환+분할만
+# 써서 결과를 예측 가능하게 유지한다. 조각은 공백 제거 후 길이 2 이상만 유효하고, 원질문은 항상 결과에
+# 포함한다(안전판 — 분해가 틀려도 원질문 경로가 그대로 살아 현행보다 나빠지지 않는다). 유효 조각이 0개면
+# dedup 결과가 자연히 [원질문] 하나로 남는다(자동 폴백). 총 개수는 settings.global_search_max_subqueries로 절단한다.
+def _decompose_question(question: str) -> list[str]:
+    normalized = question
+    for delimiter in _DECOMPOSE_DELIMITERS:
+        normalized = normalized.replace(delimiter, "\x00")
+    fragments = [p.strip() for p in normalized.split("\x00") if len(p.strip()) >= 2]
+    subqueries = list(dict.fromkeys([question] + fragments))
+    return subqueries[: settings.global_search_max_subqueries]
 
 
-# MAP: 리포트 하나마다 "질문에 도움되는가?" LLM 질의를 던져 관련도 점수+부분답변을 얻는다.
-# 개별 리포트 실패(LLM 오류/파싱 실패)는 그 리포트만 건너뛰고 계속한다(community_reporter와 동형의 장애
-# 격리). 관련도 0(또는 파싱 실패로 취급)인 리포트는 버린다. backend가 "gemini"로 해석될 때만(config로
-# 옵트인 시) 호출마다 RPD 사용량을 기록한다 — Ollama는 무료라 기본 설정에서는 기록되지 않는다.
-def _map_reports(reports: list[dict], question: str) -> list[dict]:
+# 질의 벡터와 각 리포트 벡터의 코사인 유사도를 내림차순으로 매겨 리포트 인덱스 리스트를 돌려준다.
+# embed_texts가 정규화 안 된 벡터를 반환하므로 여기서 직접 정규화한다. 순수 함수 — 같은 입력은 항상
+# 같은 순서를 낸다(결정성이 이번 신뢰성 수정의 핵심 전제).
+def _cosine_rank(query_vec: list[float], report_vecs: list[list[float]]) -> list[int]:
+    query = np.asarray(query_vec, dtype=float)
+    query = query / (np.linalg.norm(query) or 1.0)
+    matrix = np.asarray(report_vecs, dtype=float)
+    norms = np.linalg.norm(matrix, axis=1)
+    norms[norms == 0] = 1.0
+    similarities = (matrix / norms[:, None]) @ query
+    return [int(i) for i in np.argsort(-similarities)]
+
+
+# 서브질문 하나에 대해 스코프 내 리포트를 임베딩 코사인 유사도 내림차순으로 정렬해 돌려준다. 질문과
+# 모든 리포트 텍스트(title+summary)를 한 번의 embed_texts 콜로 함께 인코딩해 호출 수를 아낀다.
+def _rank_reports(subquery: str, reports: list[dict]) -> list[dict]:
+    texts = [f"{r['title']}\n{r['summary']}" for r in reports]
+    vectors = embed_texts([subquery] + texts)
+    query_vec, report_vecs = vectors[0], vectors[1:]
+    order = _cosine_rank(query_vec, report_vecs)
+    return [reports[i] for i in order]
+
+
+# 랭킹된 리포트 중 상위 K개를 자른다. K는 설정 top_k와 min_reports 중 큰 쪽이며, 리포트 총수보다
+# 클 수 없다(리포트가 하한보다 적으면 전량 MAP에 투입). 랭킹이 부정확해도 최소 하한만큼은 무조건
+# MAP에 들어가게 해 "재료 0" 실패를 막는 강제 admission의 핵심 지점이다.
+def _select_top_k(ranked: list[dict]) -> list[dict]:
+    effective_k = min(len(ranked), max(settings.global_search_min_reports, settings.global_search_top_k))
+    return ranked[:effective_k]
+
+
+# MAP: 리포트 하나 + 서브질문 하나로 "근거 포인트 추출" LLM 1콜을 던진다. temperature=0 + JSON 강제로
+# 결정성을 보강한다(진짜 신뢰성 잠금은 _select_top_k의 강제 admission). 코드펜스 제거 후 json.loads →
+# MapEvidence로 입구 검증해 evidence_points만 돌려준다. LLM 실패/JSON 파싱 실패/스키마 검증 실패는
+# 모두 그 리포트만 건너뛰고 빈 배열을 돌려준다(장애 격리 — community_reporter와 동형). backend가
+# "gemini"로 해석될 때만(config로 옵트인 시) 호출마다 RPD 사용량을 기록한다.
+def _map_report_evidence(report: dict, subquery: str) -> list[str]:
     backend = settings.global_search_map_backend
-    scored: list[dict] = []
-    for report in reports:
-        prompt = _MAP_PROMPT.format(title=report["title"], summary=report["summary"], question=question)
-        try:
-            raw = generate(prompt, backend=backend)
-            if backend in (None, "gemini"):
-                sqlite_manager.record_api_usage(1)
-            parsed = _parse_map_response(raw)
-        except Exception as exc:
-            logger.warning(
-                "[%s] 커뮤니티 %s: 글로벌 MAP 실패, 건너뜀: %s",
-                report["collection"], report["community_id"], exc,
+    prompt = _MAP_PROMPT.format(title=report["title"], summary=report["summary"], question=subquery)
+    try:
+        raw = generate(
+            prompt,
+            backend=backend,
+            temperature=settings.global_search_map_temperature,
+            format_json=True,
+        )
+        if backend in (None, "gemini"):
+            sqlite_manager.record_api_usage(1)
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        evidence = MapEvidence.model_validate(json.loads(cleaned))
+    except Exception as exc:
+        logger.warning(
+            "[%s] 커뮤니티 %s: 글로벌 MAP 실패, 건너뜀: %s",
+            report["collection"], report["community_id"], exc,
+        )
+        return []
+    return evidence.evidence_points
+
+
+# 서브질문마다 독립적으로(전역 K가 아니라 서브질문별 top-K) 리포트를 랭킹·선별해 MAP을 돌리고, 근거
+# 포인트가 나온 리포트만 서브질문·출처 라벨을 붙여 모은다. 이렇게 하면 복합질문에서 한 서브질문이
+# 다른 서브질문의 리포트를 밀어내는 일이 없다(합의 처방3). 전부 무관이면 빈 리스트를 돌려준다.
+def _collect_evidence(subqueries: list[str], reports: list[dict]) -> list[dict]:
+    bundles: list[dict] = []
+    for subquery in subqueries:
+        for report in _select_top_k(_rank_reports(subquery, reports)):
+            points = _map_report_evidence(report, subquery)
+            if not points:
+                continue
+            bundles.append(
+                {
+                    "subquery": subquery,
+                    "collection": report["collection"],
+                    "community_id": report["community_id"],
+                    "title": report["title"],
+                    "points": points,
+                }
             )
-            continue
-        if parsed["relevance"] <= 0 or not parsed["partial_answer"]:
-            continue
-        scored.append(parsed)
-    return scored
+    return bundles
 
 
-# REDUCE: 관련도 상위 부분답변들을 하나의 최종 답변으로 종합한다(LLM 1콜). 호출부(answer_question_global)가
-# scored가 비어 있지 않음을 이미 보장하므로 여기서는 항상 최소 1건 이상을 받는다. backend가 "gemini"로
-# 해석될 때만 RPD 사용량을 기록한다(MAP과 동일 원칙).
-def _reduce_answers(scored: list[dict], question: str) -> str:
-    scored.sort(key=lambda s: -s["relevance"])
-    partial_answers = "\n\n".join(f"- (관련도 {s['relevance']}) {s['partial_answer']}" for s in scored)
-    prompt = _REDUCE_PROMPT.format(question=question, partial_answers=partial_answers)
+# REDUCE: 서브질문·출처 라벨이 붙은 근거 포인트 묶음들을 하나의 최종 답변으로 종합한다(LLM 1콜).
+# 호출부(answer_question_global)가 bundles가 비어 있지 않음을 이미 보장하므로 여기서는 항상 최소
+# 1건 이상을 받는다. backend가 "gemini"로 해석될 때만 RPD 사용량을 기록한다(MAP과 동일 원칙).
+def _reduce_evidence(bundles: list[dict], question: str) -> str:
+    blocks = "\n\n".join(
+        f"[{b['subquery']}|출처={b['collection']}/{b['community_id']}/{b['title']}]\n"
+        + "\n".join(f"- {point}" for point in b["points"])
+        for b in bundles
+    )
+    prompt = _REDUCE_PROMPT.format(question=question, evidence_blocks=blocks)
     backend = settings.global_search_reduce_backend
     answer = generate(prompt, backend=backend)
     if backend in (None, "gemini"):
@@ -244,9 +320,11 @@ def _reduce_answers(scored: list[dict], question: str) -> str:
 
 # 커뮤니티 리포트(M3) 위에서 map-reduce로 코퍼스 단위 sensemaking 질문에 답한다.
 # collections=None이면 존재하는 모든 컬렉션의 리포트를 모아 종합한다(--all, 컬렉션별 union — 격벽 유지,
-# 위 _collect_global_reports 참고). level=None이면 설정 기본 레벨(레벨 0=최상위)을 쓴다.
-# 리포트가 비어 있으면(미빌드) 빌드 안내를, MAP 결과가 전부 무관하면 "못 찾음" 안내를 반환한다 —
-# CLI/GUI는 이 반환값을 그대로 보여주기만 하면 되므로 호출부에 별도 안내 로직이 필요 없다.
+# 위 _collect_global_reports 참고). level=None이면 설정 기본 레벨(레벨 0=최상위)을 쓴다. 질문은 코드로
+# 결정적 분해해(_decompose_question) 서브질문마다 독립적으로 리포트를 랭킹·MAP한 뒤(_collect_evidence),
+# 근거를 REDUCE로 종합한다. 리포트가 비어 있으면(미빌드) 빌드 안내를, 모든 서브질문·리포트에서 근거를
+# 못 찾으면 "못 찾음" 안내를 반환한다 — CLI/GUI는 이 반환값을 그대로 보여주기만 하면 되므로 호출부에
+# 별도 안내 로직이 필요 없다.
 def answer_question_global(
     question: str, collections: list[str] | None = None, level: int | None = None
 ) -> str:
@@ -255,7 +333,8 @@ def answer_question_global(
     reports = _collect_global_reports(target_collections, level_to_use)
     if not reports:
         return _NO_REPORTS_MESSAGE
-    scored = _map_reports(reports, question)
-    if not scored:
+    subqueries = _decompose_question(question)
+    bundles = _collect_evidence(subqueries, reports)
+    if not bundles:
         return _NO_RELEVANT_MESSAGE
-    return _reduce_answers(scored, question)
+    return _reduce_evidence(bundles, question)

@@ -87,6 +87,40 @@ def test_generate_raises_local_llm_error_on_missing_response_field(monkeypatch):
         local_llm_adapter.generate("질문")
 
 
+# [M4] temperature/format_json을 안 주면 payload가 기존과 완전히 바이트 동일해야 한다
+# (하위호환 핵심 증거 — ingest/reporter/answer_question 등 기존 호출부가 영향받지 않음을 보장).
+def test_ollama_payload_unchanged_without_new_kwargs(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return _FakeResponse({"response": "응답"})
+
+    monkeypatch.setattr(local_llm_adapter.requests, "post", fake_post)
+
+    local_llm_adapter.generate("질문")
+
+    assert captured["json"] == {
+        "model": settings.ollama_model_name, "prompt": "질문", "stream": False, "think": False,
+    }
+
+
+# temperature/format_json을 명시하면 payload에 options.temperature·format이 추가된다.
+def test_ollama_payload_adds_options_and_format_when_requested(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return _FakeResponse({"response": "응답"})
+
+    monkeypatch.setattr(local_llm_adapter.requests, "post", fake_post)
+
+    local_llm_adapter.generate("질문", temperature=0.0, format_json=True)
+
+    assert captured["json"]["options"] == {"temperature": 0.0}
+    assert captured["json"]["format"] == "json"
+
+
 # 실 Ollama 서버가 로컬에 떠 있을 때만 도는 통합 테스트 — 없으면 스킵(네트워크 없이 CI 통과 원칙 준수).
 def _ollama_reachable() -> bool:
     try:

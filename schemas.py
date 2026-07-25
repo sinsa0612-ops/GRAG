@@ -58,3 +58,17 @@ class ExtractedRelation(BaseModel):
 class ExtractionResult(BaseModel):
     entities: list[ExtractedEntity] = Field(default_factory=list)
     relations: list[ExtractedRelation] = Field(default_factory=list)
+
+
+# [M4] 글로벌 MAP의 LLM 구조화 출력(증거 포인트 목록)을 검증한다. evidence_points가 비면 그
+# 리포트는 이 서브질문에 무관하다는 뜻이다(관련도 채점 대신 증거추출로 바꾼 이진 판정 내장).
+class MapEvidence(BaseModel):
+    evidence_points: list[str] = Field(default_factory=list)
+
+    @field_validator("evidence_points", mode="before")
+    @classmethod
+    # 문자열이 아니거나 빈 문자열인 원소는 방어적으로 제거한다(LLM 구조화 출력의 잡음 방지).
+    def _clean_points(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return [v.strip() for v in value if isinstance(v, str) and v.strip()]
