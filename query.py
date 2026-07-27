@@ -181,10 +181,16 @@ _NO_REPORTS_MESSAGE = (
 )
 # 리포트는 있지만(빌드는 됨) 모든 서브질문·리포트에서 근거 포인트를 하나도 못 찾아 종합할 재료가 없을 때.
 _NO_RELEVANT_MESSAGE = "이 범위의 커뮤니티 리포트 중 질문과 관련된 내용을 찾지 못했습니다."
+# [D1 수리] MAP 실패(stats["failed"] > 0)가 있을 때만 답변/안내 문자열 뒤에 붙이는 각주. 로그는
+# CLI에서만 보이고 GUI/호출부에서는 안 보이므로, 사용자가 실제로 보는 반환 문자열이 "조용한 실패"를
+# 드러내는 유일한 관측 표면이다. 실패 0건이면 이 각주는 붙지 않아 반환 문자열이 기존과 바이트 동일하다.
+_MAP_FAILURE_NOTE = " ※ MAP 호출 {failed}/{calls}건이 실패했습니다 — 로그를 확인하세요."
 
 # 복합질문 분해에 쓰는 열거형 구분자 화이트리스트. 쉼표(,)와 '와/과'는 일부러 뺐다 — 쉼표는 노이즈가
 # 크고(문장 중간에도 흔함), '와/과'는 "A와 B의 관계"처럼 관계형 질문을 잘못 쪼갤 위험이 커서다.
-_DECOMPOSE_DELIMITERS = ("·", "、", " 및 ", " 그리고 ")
+# [D3 보수화] '·'도 뺐다 — 한국어에서 '·'는 열거보다 복합명사(한·미, 가·나·다) 용도가 더 흔해
+# (실측 6케이스 중 5건 오분해), '·' 열거형 질문의 분해 이득보다 오분해 위험이 더 크다.
+_DECOMPOSE_DELIMITERS = ("、", " 및 ", " 그리고 ")
 
 
 # collections가 None이면(--all) 문서·그래프 어느 쪽에든 존재가 확인된 모든 컬렉션을 대상으로 한다
@@ -207,15 +213,24 @@ def _collect_global_reports(collections: list[str], level: int) -> list[dict]:
     return reports
 
 
-# 복합질문을 열거형 구분자로만 분리하는 순수 함수(LLM 미사용, 완전 결정적). 정규식 대신 단순 치환+분할만
-# 써서 결과를 예측 가능하게 유지한다. 조각은 공백 제거 후 길이 2 이상만 유효하고, 원질문은 항상 결과에
-# 포함한다(안전판 — 분해가 틀려도 원질문 경로가 그대로 살아 현행보다 나빠지지 않는다). 유효 조각이 0개면
-# dedup 결과가 자연히 [원질문] 하나로 남는다(자동 폴백). 총 개수는 settings.global_search_max_subqueries로 절단한다.
+# 복합질문을 열거형 구분자로만 분리하는 순수 함수(LLM 미사용, 완전 결정적). [D3 보수화] 분해는
+# all-or-nothing이다 — 구분자가 하나도 없으면 즉시 원질문만 반환하고, 구분자가 있어도 조각 중 하나라도
+# "질문 형태"(물음표로 끝나거나 원질문의 마지막 어절로 끝남)가 아니면 분해를 통째로 포기하고 원질문만
+# 반환한다. 사전·형태소 분석 없이 "이 조각이 질문인가"를 결정적으로 판정하는 가장 단순한 규칙이며, 조각
+# 일부만 살아남는 침묵의 손실(무의미한 조각이 "서브질문"으로 노출되는 것)을 없앤다. 유효 분해 시에도
+# 원질문은 항상 결과에 포함한다(안전판). 총 개수는 settings.global_search_max_subqueries로 절단한다.
 def _decompose_question(question: str) -> list[str]:
+    stripped = question.strip()
+    words = stripped.split()
+    tail = words[-1] if words else ""
     normalized = question
     for delimiter in _DECOMPOSE_DELIMITERS:
         normalized = normalized.replace(delimiter, "\x00")
-    fragments = [p.strip() for p in normalized.split("\x00") if len(p.strip()) >= 2]
+    if "\x00" not in normalized:
+        return [question]
+    fragments = [p.strip() for p in normalized.split("\x00")]
+    if not all(len(f) >= 2 and (f.endswith("?") or f.endswith(tail)) for f in fragments):
+        return [question]
     subqueries = list(dict.fromkeys([question] + fragments))
     return subqueries[: settings.global_search_max_subqueries]
 
@@ -253,10 +268,12 @@ def _select_top_k(ranked: list[dict]) -> list[dict]:
 
 # MAP: 리포트 하나 + 서브질문 하나로 "근거 포인트 추출" LLM 1콜을 던진다. temperature=0 + JSON 강제로
 # 결정성을 보강한다(진짜 신뢰성 잠금은 _select_top_k의 강제 admission). 코드펜스 제거 후 json.loads →
-# MapEvidence로 입구 검증해 evidence_points만 돌려준다. LLM 실패/JSON 파싱 실패/스키마 검증 실패는
-# 모두 그 리포트만 건너뛰고 빈 배열을 돌려준다(장애 격리 — community_reporter와 동형). backend가
-# "gemini"로 해석될 때만(config로 옵트인 시) 호출마다 RPD 사용량을 기록한다.
-def _map_report_evidence(report: dict, subquery: str) -> list[str]:
+# MapEvidence로 입구 검증해 evidence_points만 돌려준다. [D1 수리] LLM 호출/JSON 파싱/스키마 검증 중
+# 하나라도 실패하면(키 누락·옛 포맷·오타 키 포함) `None`을 돌려주고 경고 로그를 남긴다 — `[]`는 LLM이
+# evidence_points를 명시적으로 빈 배열로 준, 진짜 "무관" 판정일 때만 나온다(둘을 타입으로 구분해야
+# 호출부가 "조용한 실패"와 "정말 무관"을 구별할 수 있다). backend가 "gemini"로 해석될 때만(config로
+# 옵트인 시) 호출마다 RPD 사용량을 기록한다.
+def _map_report_evidence(report: dict, subquery: str) -> list[str] | None:
     backend = settings.global_search_map_backend
     prompt = _MAP_PROMPT.format(title=report["title"], summary=report["summary"], question=subquery)
     try:
@@ -275,18 +292,29 @@ def _map_report_evidence(report: dict, subquery: str) -> list[str]:
             "[%s] 커뮤니티 %s: 글로벌 MAP 실패, 건너뜀: %s",
             report["collection"], report["community_id"], exc,
         )
-        return []
+        return None
     return evidence.evidence_points
 
 
 # 서브질문마다 독립적으로(전역 K가 아니라 서브질문별 top-K) 리포트를 랭킹·선별해 MAP을 돌리고, 근거
 # 포인트가 나온 리포트만 서브질문·출처 라벨을 붙여 모은다. 이렇게 하면 복합질문에서 한 서브질문이
-# 다른 서브질문의 리포트를 밀어내는 일이 없다(합의 처방3). 전부 무관이면 빈 리스트를 돌려준다.
-def _collect_evidence(subqueries: list[str], reports: list[dict]) -> list[dict]:
+# 다른 서브질문의 리포트를 밀어내는 일이 없다(합의 처방3). [D1 수리] MAP이 `None`(실패)을 돌려주면
+# bundles에 넣지 않고 stats["failed"]로 집계한다 — `[]`(명시적 무관)와 구분해야 사용자에게 "몇 건이
+# 조용히 실패했는지"를 각주로 알릴 수 있다. stats["examined"]는 MAP에 투입된 서로 다른 리포트 수
+# (같은 리포트가 여러 서브질문에 재사용돼도 1번만 센다), stats["calls"]는 MAP 총 호출 수다.
+def _collect_evidence(subqueries: list[str], reports: list[dict]) -> tuple[list[dict], dict]:
     bundles: list[dict] = []
+    examined: set[tuple[str, str]] = set()
+    calls = 0
+    failed = 0
     for subquery in subqueries:
         for report in _select_top_k(_rank_reports(subquery, reports)):
+            calls += 1
+            examined.add((report["collection"], report["community_id"]))
             points = _map_report_evidence(report, subquery)
+            if points is None:
+                failed += 1
+                continue
             if not points:
                 continue
             bundles.append(
@@ -298,7 +326,8 @@ def _collect_evidence(subqueries: list[str], reports: list[dict]) -> list[dict]:
                     "points": points,
                 }
             )
-    return bundles
+    stats = {"examined": len(examined), "calls": calls, "failed": failed}
+    return bundles, stats
 
 
 # REDUCE: 서브질문·출처 라벨이 붙은 근거 포인트 묶음들을 하나의 최종 답변으로 종합한다(LLM 1콜).
@@ -334,7 +363,9 @@ def answer_question_global(
     if not reports:
         return _NO_REPORTS_MESSAGE
     subqueries = _decompose_question(question)
-    bundles = _collect_evidence(subqueries, reports)
-    if not bundles:
-        return _NO_RELEVANT_MESSAGE
-    return _reduce_evidence(bundles, question)
+    bundles, stats = _collect_evidence(subqueries, reports)
+    answer = _NO_RELEVANT_MESSAGE if not bundles else _reduce_evidence(bundles, question)
+    # [D1 수리] MAP 실패가 하나라도 있으면 그 사실을 답변 뒤에 명시한다(실패 0건이면 바이트 동일 유지).
+    if stats["failed"] > 0:
+        answer += _MAP_FAILURE_NOTE.format(failed=stats["failed"], calls=stats["calls"])
+    return answer

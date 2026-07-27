@@ -5,6 +5,8 @@
 # generate·embed_texts는 항상 mock으로 차단해 네트워크 없이 1초 내 종료된다(실 Ollama 통합은 맨 끝
 # skipif 스모크로 격리).
 import json
+import logging
+import math
 
 import pytest
 import requests
@@ -22,26 +24,69 @@ def _seed_report(collection: str, community_id: str, level: int, title: str, sum
     sqlite_manager.upsert_community_report(collection, community_id, level, title, summary, None)
 
 
-# 순서를 보존하는 가짜 임베딩 — 질의는 항상 영벡터(정규화 시 그대로 [0])라 모든 리포트와의 코사인
-# 유사도가 0으로 동률이 되고, np.argsort는 안정 정렬이라 원래 리스트 순서가 그대로 유지된다.
-# 랭킹 자체가 아니라 MAP/REDUCE/오케스트레이션을 검증하는 테스트에서 순서를 예측 가능하게 하려고 쓴다.
-def _order_preserving_embed_texts(texts):
-    return [[float(i)] for i, _ in enumerate(texts)]
+# [D4 수리] 다차원 결정적 가짜 임베딩 — 옛 1차원 버전은 코사인 유사도가 부호만 남아 전부 동점이 되는
+# 바람에 np.argsort(-similarities)를 np.argsort(similarities)로 뒤집어도 랭킹 테스트가 전부 통과했다
+# (랭킹 로직이 사실상 검증되지 않음). 질의(index 0)는 [1.0, 0.0], 리포트 i(1-based, 총 n개)는
+# [cos θ_i, sin θ_i](θ_i = i * (π / (2 * (n + 1))))를 받아 유사도(=cos θ_i)가 입력 순서대로
+# 엄격히 감소한다(동률 없음) — "입력 순서 = 랭킹 순서"라는 기존 테스트들의 전제는 유지하면서, 정렬
+# 방향을 뒤집으면 반환 순서가 실제로 뒤바뀌게 만든다. MAP/REDUCE/오케스트레이션을 검증하는 테스트에서
+# 순서를 예측 가능하게 하려고 쓴다.
+def _ranked_embed_texts(texts):
+    n = len(texts) - 1
+    vectors = [[1.0, 0.0]]
+    for i in range(1, n + 1):
+        theta = i * (math.pi / (2 * (n + 1)))
+        vectors.append([math.cos(theta), math.sin(theta)])
+    return vectors
 
 
 # --- 순수 함수: 복합질문 분해(_decompose_question, LLM 미사용) ---
 
 
-def test_decompose_splits_on_enumeration_markers():
-    # 구분자가 4개 들어간 질문 → 원질문 포함 조각 분해 + 상한(기본 4) 절단까지 한 번에 확인한다.
-    question = "카카오·네이버·쿠팡 및 배달의민족 그리고 토스의 실적은?"
+# [D3 보수화] 옛 test_decompose_splits_on_enumeration_markers는 삭제했다 — 새 규칙(조각이 전부
+# "질문 형태"일 때만 분해)에서는 "카카오·네이버·쿠팡 및 배달의민족 그리고 토스의 실적은?"의 앞쪽 조각들이
+# "?"로도 원질문의 마지막 어절로도 끝나지 않아 분해 자체가 통째로 포기되고 [원질문]만 남는다(이 파일
+# 아래 test_decompose_keeps_middot_and_bare_keyword_intact·test_decompose_splits_genuine_multi_question이
+# 그 대체 회귀선이다).
 
-    result = query._decompose_question(question)
 
-    assert result[0] == question  # 원질문이 항상 첫 자리에 포함(안전판)
-    assert len(result) == settings.global_search_max_subqueries  # 절단 확인(기본 4)
-    assert "카카오" in result and "네이버" in result  # 조각 분해 확인
-    assert "토스의 실적은?" not in result  # 상한을 넘는 조각은 잘려나감
+@pytest.mark.parametrize(
+    "question",
+    [
+        "한·미 정상회담의 주요 의제는?",
+        "가·나·다·라·마 사업의 예산은?",
+        "김철수 및 박영희의 역할은?",
+        "매출 및 영업이익 추이를 알려줘",
+    ],
+)
+def test_decompose_keeps_middot_and_bare_keyword_intact(question):
+    # '·'는 구분자에서 빠졌으므로(한·미처럼 복합명사 용도가 더 흔함) 무조건 원질문 그대로.
+    # '및'이 있어도 조각(예: "김철수", "매출")이 "?"로도 원질문 마지막 어절로도 끝나지 않으면
+    # 분해를 통째로 포기한다(all-or-nothing) — 없는 개념을 서브질문으로 만들지 않는다.
+    assert query._decompose_question(question) == [question]
+
+
+@pytest.mark.parametrize(
+    "question, expected",
+    [
+        (
+            "카카오의 실적은? 그리고 네이버의 전략은?",
+            ["카카오의 실적은? 그리고 네이버의 전략은?", "카카오의 실적은?", "네이버의 전략은?"],
+        ),
+        (
+            "카카오 실적을 알려줘 그리고 네이버 전략을 알려줘",
+            [
+                "카카오 실적을 알려줘 그리고 네이버 전략을 알려줘",
+                "카카오 실적을 알려줘",
+                "네이버 전략을 알려줘",
+            ],
+        ),
+    ],
+)
+def test_decompose_splits_genuine_multi_question(question, expected):
+    # 두 케이스 모두 조각이 전부 "?"로 끝나거나(1번) 원질문의 마지막 어절 "알려줘"로 끝나(2번)
+    # 진짜 분해 가능한 복합질문으로 판정된다.
+    assert query._decompose_question(question) == expected
 
 
 def test_decompose_does_not_split_relational():
@@ -76,6 +121,38 @@ def test_cosine_rank_is_deterministic_and_orders_by_similarity():
     assert first == second  # N회 호출해도 항상 같은 순서(결정성)
 
 
+def test_cosine_rank_ties_are_deterministic():
+    # 완전 동일 벡터라 유사도가 전부 동률일 때도 매 호출 같은 순서가 나오는지 확인한다(동률에서만
+    # 정렬 불안정성이 드러나므로, 이 케이스가 D4가 노렸던 "안정 정렬" 성질의 실제 회귀 방지선이다).
+    query_vec = [1.0, 0.0]
+    report_vecs = [[1.0, 0.0]] * 6
+
+    results = [query._cosine_rank(query_vec, report_vecs) for _ in range(20)]
+
+    assert all(r == results[0] for r in results)
+
+
+# --- 순수 함수: 서브질문별 리포트 랭킹(_rank_reports, 다차원 가짜 임베딩으로 실제 정렬 검증) ---
+
+
+def test_rank_reports_orders_by_similarity_and_excludes_query(monkeypatch):
+    # _ranked_embed_texts는 "먼저 넣은 리포트일수록 유사도가 높다"는 성질을 갖는다 — 그 성질을 이용해
+    # 사람이 읽을 땐 순위와 반대로(4위부터) 리스트를 구성해, _rank_reports가 실제로 유사도 내림차순
+    # 정렬을 수행하는지(놉으로 두거나 뒤집으면 걸리는지) 확인한다.
+    reports = [
+        {"title": "4위 리포트", "summary": "네 번째로 유사"},
+        {"title": "3위 리포트", "summary": "세 번째로 유사"},
+        {"title": "2위 리포트", "summary": "두 번째로 유사"},
+        {"title": "1위 리포트", "summary": "가장 유사"},
+    ]
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
+
+    ranked = query._rank_reports("질문?", reports)
+
+    assert [r["title"] for r in ranked] == ["4위 리포트", "3위 리포트", "2위 리포트", "1위 리포트"]
+    assert len(ranked) == 4  # 질의 벡터(vectors[0])가 리포트로 새어들지 않음(vectors[1:] 슬라이싱)
+
+
 # --- 순수 함수: top-K 하한 강제(_select_top_k) ---
 
 
@@ -93,20 +170,65 @@ def test_select_top_k_enforces_floor(monkeypatch):
 
 
 def test_map_evidence_empty_points_treated_as_irrelevant(monkeypatch):
+    # 여분 키("reasoning")가 붙어도 무해하게 무시되는지 함께 확인한다(오타 키와 달리 "여분"은 실패가
+    # 아니다 — extra="forbid"를 안 쓰는 이유, MapEvidence 기대 동작 표 6행).
     report = {"collection": C1, "community_id": "c1", "title": "제목", "summary": "요약"}
-    monkeypatch.setattr(query, "generate", lambda *a, **k: json.dumps({"evidence_points": []}))
+    monkeypatch.setattr(
+        query, "generate",
+        lambda *a, **k: json.dumps({"evidence_points": [], "reasoning": "잡담"}),
+    )
 
     assert query._map_report_evidence(report, "질문?") == []
 
 
+# --- [D1 수리] 무진단 빈 답변 차단: 키 누락/옛 포맷/오타 키는 None + 경고 로그(빈 리스트와 구분) ---
+
+
+def test_map_evidence_missing_key_is_failure_not_empty(monkeypatch, caplog):
+    # evidence_points 키 자체가 없는 JSON({}) — 필수 필드 누락이라 ValidationError → None + 경고 1건.
+    report = {"collection": C1, "community_id": "c1", "title": "제목", "summary": "요약"}
+    monkeypatch.setattr(query, "generate", lambda *a, **k: json.dumps({}))
+
+    with caplog.at_level(logging.WARNING, logger="query"):
+        result = query._map_report_evidence(report, "질문?")
+
+    assert result is None  # 빈 리스트([])가 아니라 실패임이 타입으로 드러난다
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        json.dumps({"relevance": 9, "partial_answer": "정상적으로 보이는 옛 포맷 응답"}),  # 옛 포맷
+        json.dumps({"evidencePoints": ["근거"]}),  # 오타 키(camelCase)
+    ],
+    ids=["old_relevance_format", "typo_key_evidencePoints"],
+)
+def test_map_evidence_old_format_is_failure(monkeypatch, caplog, raw_json):
+    # 둘 다 "유효한 JSON"이지만 evidence_points 키가 없으므로 조용히 빈 리스트로 통과해선 안 되고,
+    # None + 경고 1건으로 실패가 드러나야 한다(이번 결함군의 핵심 증상 — 전 리포트가 이 상태면 사용자는
+    # "관련 내용을 찾지 못했습니다"만 보고 단서가 0이었다).
+    report = {"collection": C1, "community_id": "c1", "title": "제목", "summary": "요약"}
+    monkeypatch.setattr(query, "generate", lambda *a, **k: raw_json)
+
+    with caplog.at_level(logging.WARNING, logger="query"):
+        result = query._map_report_evidence(report, "질문?")
+
+    assert result is None
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+
+
 def test_map_evidence_skips_parse_failure_and_continues(monkeypatch):
-    # 리포트 하나는 깨진 JSON을 주고, 다른 하나는 정상 응답을 준다 — 깨진 쪽만 스킵되고 계속 진행되는지
-    # _collect_evidence 수준에서 확인한다(장애 격리).
+    # 리포트 하나는 깨진 JSON을 주고, 다른 하나는 정상 응답을 준다 — 깨진 쪽만 실패로 집계되고(스킵)
+    # 계속 진행되는지 _collect_evidence 수준에서 확인한다(장애 격리). [D1 수리] 반환형이 튜플이 됐으므로
+    # (bundles, stats)로 언패킹하고, 실패 1건이 stats["failed"]에 잡히는지도 함께 확인한다.
     reports = [
         {"collection": C1, "community_id": "bad", "title": "깨진 응답", "summary": "요약"},
         {"collection": C1, "community_id": "good", "title": "정상 응답", "summary": "요약"},
     ]
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     def fake_generate(prompt, backend=None, temperature=None, format_json=False):
         if "깨진 응답" in prompt:
@@ -115,11 +237,12 @@ def test_map_evidence_skips_parse_failure_and_continues(monkeypatch):
 
     monkeypatch.setattr(query, "generate", fake_generate)
 
-    bundles = query._collect_evidence(["질문?"], reports)
+    bundles, stats = query._collect_evidence(["질문?"], reports)
 
     assert len(bundles) == 1
     assert bundles[0]["title"] == "정상 응답"
     assert bundles[0]["points"] == ["정상 근거"]
+    assert stats == {"examined": 2, "calls": 2, "failed": 1}
 
 
 # --- 서브질문별 독립 top-K(_collect_evidence) ---
@@ -154,12 +277,13 @@ def test_collect_evidence_ranks_per_subquery(monkeypatch):
         query, "generate", lambda *a, **k: json.dumps({"evidence_points": ["근거"]})
     )
 
-    bundles = query._collect_evidence(["A질문", "B질문"], reports)
+    bundles, stats = query._collect_evidence(["A질문", "B질문"], reports)
 
     titles_by_subquery = {b["subquery"]: b["title"] for b in bundles}
     assert titles_by_subquery["A질문"] == "A주제 리포트"
     assert titles_by_subquery["B질문"] == "B주제 리포트"
     assert len(bundles) == 2  # 서브질문마다 정확히 1개씩(top_k=1) — 서로 밀어내지 않음
+    assert stats["failed"] == 0  # 전부 정상 응답이라 실패 0건
 
 
 # --- MAP이 하드코딩이 아니라 설정값을 그대로 쓰는지(temperature/format_json) ---
@@ -220,7 +344,7 @@ def test_global_no_reports(monkeypatch):
     sqlite_manager.init_schema()
     calls = []
     monkeypatch.setattr(query, "generate", lambda *a, **k: calls.append(1) or "무시됨")
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     result = query.answer_question_global("질문?", collections=["없는컬렉션"])
 
@@ -238,12 +362,55 @@ def test_global_all_irrelevant(monkeypatch):
         return json.dumps({"evidence_points": []})
 
     monkeypatch.setattr(query, "generate", fake_generate)
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     result = query.answer_question_global("질문?", collections=[C1])
 
     assert result == query._NO_RELEVANT_MESSAGE
     assert len(calls) == 1  # MAP 1콜만 있고 REDUCE 호출은 없어야 함(낭비 호출 방지)
+
+
+# --- [D1 수리] MAP 실패가 사용자가 보는 반환 문자열에 각주로 드러나는지 ---
+
+
+def test_global_answer_appends_map_failure_note(monkeypatch):
+    # 리포트 2개 중 하나는 깨진 JSON(MAP 실패 1건), 하나는 정상 근거(성공 1건) → 총 MAP 2콜.
+    # 반환 문자열에 "※ MAP 호출 1/2건이 실패했습니다"가 포함돼야 한다 — 로그만으로는 CLI 밖에서
+    # 안 보이던 실패가 이제 사용자가 실제로 읽는 답변 표면에 드러난다는 증거.
+    sqlite_manager.init_schema()
+    _seed_report(C1, "good", 0, "정상 리포트", "요약")
+    _seed_report(C1, "bad", 0, "깨진 리포트", "요약")
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
+
+    def fake_generate(prompt, backend=None, temperature=None, format_json=False):
+        if "깨진 리포트" in prompt:
+            return "이건 JSON이 아님"
+        if "리포트 제목:" in prompt:  # MAP 프롬프트만 이 라벨을 가짐(REDUCE와 구분)
+            return json.dumps({"evidence_points": ["근거"]})
+        return "종합 답변"
+
+    monkeypatch.setattr(query, "generate", fake_generate)
+
+    result = query.answer_question_global("질문?", collections=[C1])
+
+    assert result == "종합 답변 ※ MAP 호출 1/2건이 실패했습니다 — 로그를 확인하세요."
+
+
+def test_global_answer_bytes_identical_when_no_map_failures(monkeypatch):
+    # [바이트 동일 불변] MAP 실패가 0건이면 반환 문자열은 각주 없이 REDUCE 출력 그대로여야 한다 —
+    # 기존 등가 단언 테스트들(test_global_all_irrelevant 등)을 깨지 않는다는 것을 문자열 그대로
+    # 비교(in이 아니라 ==)해 직접 증명한다.
+    sqlite_manager.init_schema()
+    _seed_report(C1, "a1", 0, "리포트", "요약")
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
+    monkeypatch.setattr(
+        query, "generate",
+        lambda *a, **k: json.dumps({"evidence_points": ["근거"]}) if "리포트 제목:" in a[0] else "종합 답변",
+    )
+
+    result = query.answer_question_global("질문?", collections=[C1])
+
+    assert result == "종합 답변"  # 각주 없음, 바이트 동일
 
 
 # --- RPD 기록은 backend가 gemini로 해석될 때만 ---
@@ -256,7 +423,7 @@ def test_map_and_reduce_do_not_record_usage_with_default_ollama_backend(monkeypa
         query, "generate",
         lambda *a, **k: json.dumps({"evidence_points": ["근거"]}) if "리포트 제목:" in a[0] else "답",
     )
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     query.answer_question_global("질문?", collections=[C1])
 
@@ -272,7 +439,7 @@ def test_map_and_reduce_record_usage_when_backend_is_gemini(monkeypatch):
         query, "generate",
         lambda *a, **k: json.dumps({"evidence_points": ["근거"]}) if "리포트 제목:" in a[0] else "답",
     )
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     query.answer_question_global("질문?", collections=[C1])
 
@@ -303,7 +470,7 @@ def test_cli_query_mode_global_dispatches_to_answer_question_global_when_fresh(m
     graph_manager.init_schema()
     _seed_report(C1, "a1", 0, "제목", "요약")
     sqlite_manager.clear_communities_dirty(C1, "sig")
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     def fake_generate(prompt, backend=None, temperature=None, format_json=False):
         if "리포트 제목:" in prompt:  # MAP 프롬프트만 이 라벨을 가짐(REDUCE와 구분)
@@ -325,7 +492,7 @@ def test_cli_query_mode_global_passes_level_through(monkeypatch, capsys):
     _seed_report(C1, "top", 0, "레벨0제목", "레벨0요약")
     _seed_report(C1, "leaf", 1, "레벨1제목", "레벨1요약")
     sqlite_manager.clear_communities_dirty(C1, "sig")
-    monkeypatch.setattr(query, "embed_texts", _order_preserving_embed_texts)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
 
     def fake_generate(prompt, backend=None, temperature=None, format_json=False):
         if "레벨0제목" in prompt:

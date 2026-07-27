@@ -60,10 +60,12 @@ class ExtractionResult(BaseModel):
     relations: list[ExtractedRelation] = Field(default_factory=list)
 
 
-# [M4] 글로벌 MAP의 LLM 구조화 출력(증거 포인트 목록)을 검증한다. evidence_points가 비면 그
-# 리포트는 이 서브질문에 무관하다는 뜻이다(관련도 채점 대신 증거추출로 바꾼 이진 판정 내장).
+# [M4] 글로벌 MAP의 LLM 구조화 출력(증거 포인트 목록)을 검증한다. evidence_points는 필수 필드다 —
+# 빈 리스트([])는 LLM이 명시적으로 "무관"이라 판정한 경우이고, 키 자체가 없거나 이름이 틀리면(옛
+# relevance/partial_answer 포맷, evidencePoints 오타)는 ValidationError로 검증 실패가 드러난다
+# ([D1 수리] 관대한 default_factory가 스키마 드리프트를 조용히 빈 리스트로 흡수하던 것을 막는다).
 class MapEvidence(BaseModel):
-    evidence_points: list[str] = Field(default_factory=list)
+    evidence_points: list[str]
 
     @field_validator("evidence_points", mode="before")
     @classmethod
