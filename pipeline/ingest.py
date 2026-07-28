@@ -1,6 +1,7 @@
 # 문서 처리 파이프라인 — 읽기 → 변경감지 → 청킹 → LLM 추출 → 검증 → 저장.
 import json
 import logging
+import re
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -9,7 +10,7 @@ from adapters.llm_adapter import generate
 from config import settings
 from db import document_store, graph_manager, sqlite_manager, vector_manager
 from pipeline import entity_resolution
-from schemas import EntityType, ExtractionResult
+from schemas import EntityType, ExtractedEntity, ExtractedRelation, ExtractionResult
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,13 @@ _ALLOWED_TYPES = ", ".join(t.value for t in EntityType)
 
 # 자주 쓰는 관계 이름 시드 목록. type처럼 강제하지는 않고(열린 어휘), '가능하면 이것부터 재사용'하도록 권장만 한다.
 # 초기 문서들이 같은 관계를 제각각(WORKS_AT/EMPLOYED_BY/...)으로 만들어 파편화되는 것을 줄인다.
+# FOUNDED~OPERATES는 분해 추출 PoC(설립/인수/지분/분사/운영 방향 실측 검증)로 추가됐다.
 _SEED_PREDICATES = ", ".join(
     [
         "WORKS_AT", "MEMBER_OF", "PART_OF", "LOCATED_IN", "OWNS", "MANAGES",
         "CREATED", "PRODUCES", "USES", "PARTICIPATED_IN", "OCCURRED_ON",
         "HAS_ROLE", "AFFILIATED_WITH", "CAUSES", "RELATED_TO",
+        "FOUNDED", "ACQUIRED", "MERGED_WITH", "SPUN_OFF", "HOLDS_STAKE", "OPERATES",
     ]
 )
 
@@ -93,6 +96,79 @@ predicate는 영어 대문자 스네이크케이스. 가능하면 다음을 먼�
 텍스트:
 {chunk}
 """
+
+# --- 분해 추출(decomposed extraction) — 로컬 모델 과부하 회피 ---
+# 근거: 단일패스(엔티티+관계 동시 요구)는 qwen3:14b에서 구조가 무너진다(정신아 누락·소유방향 역전·
+# 날짜 노이즈화 실측, implementation_plan.md ①). 좁게 나눠 여러 번 물으면 회복된다(같은 문서로 4/4 검증,
+# scratchpad/matchup/poc_v2.py). 아래 프롬프트 문구는 그 PoC를 그대로 이식한 것 — 임의 변경 금지(회귀 위험).
+
+# 패스 A(엔티티) — schemas.EntityType을 DATE 제외 4개 좁은 타입군으로 나눠 그룹마다 1콜씩 묻는다.
+# 날짜는 어떤 그룹에도 없다(valid_from 전용 — 엔티티로 승격시키지 않음).
+_ENTITY_TYPE_GROUPS: dict[str, str] = {
+    "사람": (
+        '다음 텍스트에 등장하는 모든 "사람(인물)"을 그 직책·역할과 함께 빠짐없이 뽑아라. '
+        "사람이 아닌 것은 넣지 마라.\n"
+        '순수 JSON만: {"entities":[{"name":"이름","type":"PERSON","description":"직책/역할"}]}\n\n'
+    ),
+    "조직·집단": (
+        '다음 텍스트에 등장하는 모든 "조직·회사·기관·단체·정부·법인"을 빠짐없이 뽑아라. '
+        "사람·장소·날짜·숫자는 넣지 마라. 이름은 가장 짧은 표준 명칭.\n"
+        '순수 JSON만: {"entities":[{"name":"이름","type":"ORGANIZATION","description":"짧은 설명"}]}\n\n'
+    ),
+    "사물·작품·개념·사건": (
+        '다음 텍스트에 등장하는 모든 "사물·제품·서비스·앱·작품·기술·개념·사건"을 빠짐없이 뽑아라. '
+        "사람·조직·장소·날짜·숫자는 넣지 마라. 이름은 가장 짧은 표준 명칭.\n"
+        '순수 JSON만: {"entities":[{"name":"이름","type":"OBJECT|WORK|CONCEPT|EVENT","description":"짧은 설명"}]}\n\n'
+    ),
+    "장소": (
+        '다음 텍스트에 등장하는 모든 "장소·지역·건물"을 빠짐없이 뽑아라. '
+        "그 외(사람·조직·날짜)는 넣지 마라.\n"
+        '순수 JSON만: {"entities":[{"name":"이름","type":"LOCATION","description":"짧은 설명"}]}\n\n'
+    ),
+}
+
+# 엔티티 패스 전용 어휘 힌트(이름만 — 이 패스는 관계를 뽑지 않아 predicate 힌트가 필요 없다).
+_ENTITY_PASS_VOCAB_HINT = """\
+이미 그래프에 쓰이고 있는 이름이야. 같은 대상이면 새로 만들지 말고 아래 표현을 정확히 그대로 재사용해.
+- 기존 엔티티 이름: {names}
+
+"""
+
+# 패스 B(관계) — 패스 A가 뽑은 엔티티 목록을 주입하고, 방향이 헷갈리는 관계는 예시로 콕 박아 강제한다.
+# (방향 역전·창업자 누락을 고친 핵심이 '엔티티 목록 + 방향 예시'였다 — PoC 실측.)
+_RELATION_PASS_PROMPT = """\
+아래 [엔티티 목록]에 있는 대상들 사이의 관계만, 텍스트가 실제로 말하는 것만 뽑아라.
+이름은 반드시 목록의 표기를 그대로 써라. 관계에는 방향이 있다. 아래 예시의 방향을 정확히 따르라:
+- 설립/창립: 설립한 사람·모체가 source. 예) 김범수 -[FOUNDED]-> 카카오
+- 소유(모회사→자회사): 카카오 -[OWNS]-> 카카오뱅크
+- 지분 보유(주주→회사): 국민연금공단 -[HOLDS_STAKE]-> 카카오
+- 인수: 인수한 쪽이 source. 예) 카카오 -[ACQUIRED]-> 로엔엔터테인먼트
+- 분사: 모체가 source. 예) 카카오 -[SPUN_OFF]-> 카카오모빌리티
+- 운영: 운영 주체가 source. 예) 카카오모빌리티 -[OPERATES]-> 카카오 T
+predicate는 영어 대문자 스네이크. 가능하면 다음을 먼저 재사용: {seed_predicates}
+날짜/시점은 valid_from 속성으로만(엔티티로 만들지 마, 없으면 빈 문자열).
+순수 JSON만 출력: {{"relations":[{{"source":"...","target":"...","predicate":"...","valid_from":""}}]}}
+{known_predicates_hint}
+[엔티티 목록]
+{entity_list}
+
+텍스트:
+{chunk}
+"""
+
+
+# 날짜·비율·순수숫자 이름을 모델 지시와 무관하게 코드로 최종 차단한다(PoC 실측 노이즈 패턴 이식).
+# 모델 지시(프롬프트)만 믿지 않는다 — 엔티티 패스 파싱 시점과 _reconcile의 고아 끝점 승격 시점 둘 다에서 쓴다.
+def _is_noise_name(name: str) -> bool:
+    if not name:
+        return True
+    if "%" in name or "만 명" in name or "천원" in name:
+        return True
+    if re.search(r"\d", name) and re.search(r"(년|월|일)", name):  # "1995년 2월 16일" 류
+        return True
+    if re.fullmatch(r"[\d,.\s]+", name):  # 순수 숫자
+        return True
+    return False
 
 
 # 이미 그래프에 쓰인 이름/관계 어휘를 프롬프트 앞에 붙인다 (어휘 파편화 방지).
@@ -235,6 +311,192 @@ def glean_chunk(
     )
 
 
+def _build_entity_pass_prompt(group_instruction: str, chunk: str, known_names: list[str]) -> str:
+    relevant_names = [name for name in known_names if name and name in chunk][: settings.max_name_hints]
+    vocab_hint = ""
+    if relevant_names:
+        vocab_hint = _ENTITY_PASS_VOCAB_HINT.format(names=", ".join(relevant_names))
+    return vocab_hint + group_instruction + chunk
+
+
+# 패스 A 응답 하나(그룹 1개분)를 파싱해 엔티티만 뽑는다. 개별 항목이 스키마에 안 맞으면 그 항목만 버리고
+# 계속한다(청크 전체를 버리지 않음). 노이즈 필터는 여기서 1차로 걸고 _reconcile에서 방어적으로 한 번 더 건다.
+def _parse_entity_group(raw_text: str) -> list[ExtractedEntity]:
+    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+    data = json.loads(cleaned)
+    if isinstance(data, dict):
+        data = _normalize_field_names(data)
+    items = data.get("entities") if isinstance(data, dict) else None
+    entities = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            entity = ExtractedEntity.model_validate(item)
+        except ValidationError:
+            continue
+        if _is_noise_name(entity.name):
+            continue
+        entities.append(entity)
+    return entities
+
+
+# 패스 A(엔티티) — 청크 하나를 4개 타입군(_ENTITY_TYPE_GROUPS)으로 나눠 그룹마다 1콜씩 좁게 묻는다.
+# 그룹 하나가 실패(호출 오류/JSON 파싱 실패)해도 다른 그룹은 계속 진행한다 — 그룹 전부가 실패했을 때만
+# 이 청크를 통째로 건너뛴다(None 반환). 반환값은 dedup 전 원시 목록 — dedup/타입충돌은 _reconcile 소관.
+def extract_entities_pass(
+    chunk: str,
+    known_names: list[str] | None = None,
+    model: str | None = None,
+    backend: str | None = None,
+) -> list[ExtractedEntity] | None:
+    entities: list[ExtractedEntity] = []
+    ok_groups = 0
+    for group_label, instruction in _ENTITY_TYPE_GROUPS.items():
+        prompt = _build_entity_pass_prompt(instruction, chunk, known_names or [])
+        try:
+            raw_text = generate(
+                prompt, model=model, backend=backend,
+                temperature=settings.extraction_temperature, format_json=True,
+            )
+            entities.extend(_parse_entity_group(raw_text))
+            ok_groups += 1
+        except json.JSONDecodeError as exc:
+            logger.warning("엔티티 패스[%s] 응답 파싱 실패, 이 타입군은 건너뜀: %s", group_label, exc)
+        except Exception as exc:
+            logger.warning("엔티티 패스[%s] 호출 실패, 이 타입군은 건너뜀: %s", group_label, exc)
+    if ok_groups == 0:
+        logger.error("엔티티 패스 전체 실패, 이 청크는 건너뜀")
+        return None
+    return entities
+
+
+# 패스 B 응답을 파싱해 관계만 뽑는다. 개별 항목이 스키마에 안 맞으면 그 항목만 버린다.
+def _parse_relations(raw_text: str) -> list[ExtractedRelation]:
+    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+    data = json.loads(cleaned)
+    if isinstance(data, dict):
+        data = _normalize_field_names(data)
+    items = data.get("relations") if isinstance(data, dict) else None
+    relations = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            relations.append(ExtractedRelation.model_validate(item))
+        except ValidationError:
+            continue
+    return relations
+
+
+# 패스 B(관계) — 패스 A가 뽑은 엔티티 이름 목록을 주입해 그 사이의 관계만 묻는다(방향 예시 포함).
+# 엔티티가 하나도 없으면 물을 대상이 없으므로 호출 자체를 생략한다. 실패해도 빈 리스트만 반환하고
+# 예외를 올리지 않는다 — 관계 패스 실패가 이미 뽑힌 엔티티까지 버리게 하면 안 된다(계획 ④).
+def extract_relations_pass(
+    chunk: str,
+    entity_names: list[str],
+    known_predicates: list[str] | None = None,
+    model: str | None = None,
+    backend: str | None = None,
+) -> list[ExtractedRelation]:
+    if not entity_names:
+        return []
+    known_predicates_hint = ""
+    if known_predicates:
+        known_predicates_hint = f"이미 이 컬렉션에 쓰인 관계 이름(같은 뜻이면 재사용): {', '.join(known_predicates)}\n"
+    prompt = _RELATION_PASS_PROMPT.format(
+        seed_predicates=_SEED_PREDICATES,
+        known_predicates_hint=known_predicates_hint,
+        entity_list=", ".join(entity_names),
+        chunk=chunk,
+    )
+    try:
+        raw_text = generate(
+            prompt, model=model, backend=backend,
+            temperature=settings.extraction_temperature, format_json=True,
+        )
+    except Exception as exc:
+        logger.warning("관계 패스 호출 실패, 관계 없이 진행: %s", exc)
+        return []
+    try:
+        return _parse_relations(raw_text)
+    except json.JSONDecodeError as exc:
+        logger.warning("관계 패스 응답 파싱 실패, 관계 없이 진행: %s", exc)
+        return []
+
+
+# 패스 A/B 결과를 하나의 ExtractionResult로 합치는 순수 함수(LLM 없음) — dedup·타입충돌·고아 끝점 처리.
+# 1) 엔티티는 이름(name) 키로 dedup. 타입 충돌: 구체 타입이 OTHER를 이기고, 둘 다 구체면 먼저 것을 유지하며
+#    경고를 남긴다. description은 비어있지 않은 쪽 우선, 둘 다 있으면 먼저 것.
+# 2) 관계는 (source, predicate, target) 3튜플로 dedup(먼저 것 유지).
+# 3) 관계 끝점이 엔티티 목록에 없으면(패스 A가 놓쳤지만 패스 B가 같은 청크에서 실존을 확인한 경우)
+#    OTHER로 최소 엔티티를 추가해 관계를 살린다 — graph_manager.upsert_relation이 양 끝 노드가
+#    없으면 관계를 조용히 버리기 때문에 필수(안 하면 "김범수→FOUNDED→카카오"가 죽는다).
+#    단, 끝점 이름 자체가 노이즈(_is_noise_name)면 엔티티를 만들지 않고 그 관계를 통째로 버린다.
+def _reconcile(entities: list[ExtractedEntity], relations: list[ExtractedRelation]) -> ExtractionResult:
+    entity_map: dict[str, ExtractedEntity] = {}
+    for entity in entities:
+        if _is_noise_name(entity.name):
+            continue
+        existing = entity_map.get(entity.name)
+        if existing is None:
+            entity_map[entity.name] = entity
+            continue
+        if existing.type != EntityType.OTHER and entity.type != EntityType.OTHER and existing.type != entity.type:
+            logger.warning(
+                "엔티티 타입 충돌: %s (%s 유지, %s 무시)", entity.name, existing.type.value, entity.type.value
+            )
+        winner_type = existing.type if existing.type != EntityType.OTHER else entity.type
+        winner_desc = existing.description or entity.description
+        entity_map[entity.name] = ExtractedEntity(name=entity.name, type=winner_type, description=winner_desc)
+
+    relation_map: dict[tuple[str, str, str], ExtractedRelation] = {}
+    for relation in relations:
+        key = (relation.source, relation.predicate, relation.target)
+        if key not in relation_map:
+            relation_map[key] = relation
+
+    kept_relations: list[ExtractedRelation] = []
+    orphan_endpoints = 0
+    total_endpoints = 0
+    for relation in relation_map.values():
+        endpoints = (relation.source, relation.target)
+        total_endpoints += len(endpoints)
+        if any(ep not in entity_map and _is_noise_name(ep) for ep in endpoints):
+            logger.warning("관계 폐기(끝점이 노이즈 이름): %s -[%s]-> %s", relation.source, relation.predicate, relation.target)
+            continue
+        for ep in endpoints:
+            if ep not in entity_map:
+                entity_map[ep] = ExtractedEntity(name=ep, type=EntityType.OTHER, description="")
+                orphan_endpoints += 1
+        kept_relations.append(relation)
+
+    if total_endpoints and orphan_endpoints > total_endpoints / 2:
+        logger.warning(
+            "고아 끝점 과다(%d/%d) — 패스 B가 목록과 다른 표기를 쓰는 이름 드리프트 의심", orphan_endpoints, total_endpoints
+        )
+
+    return ExtractionResult(entities=list(entity_map.values()), relations=kept_relations)
+
+
+# 분해 추출 오케스트레이션 — 패스 A(엔티티, 타입군 4분할) → 패스 B(관계, 엔티티 목록 주입) → _reconcile.
+# 패스 A가 완전히 실패하면(그룹 전부 실패) 이 청크를 통째로 건너뛴다(None). 패스 B 실패는 빈 관계로
+# 흡수되고 엔티티는 그대로 살아남는다(위 extract_relations_pass 계약).
+def extract_chunk_decomposed(
+    chunk: str,
+    known_names: list[str] | None = None,
+    known_predicates: list[str] | None = None,
+    model: str | None = None,
+    backend: str | None = None,
+) -> ExtractionResult | None:
+    entities = extract_entities_pass(chunk, known_names, model=model, backend=backend)
+    if entities is None:
+        return None
+    entity_names = [e.name for e in entities]
+    relations = extract_relations_pass(chunk, entity_names, known_predicates, model=model, backend=backend)
+    return _reconcile(entities, relations)
+
+
 # name이 그 컬렉션의 기존 엔티티 정식 이름/alias와 정확히 일치하면 그 정식 이름으로 치환한다.
 # 일치하는 게 alias 매칭이었다면(이름 자체와는 다름) 그 사실을 alias로 기록해둔다.
 def _resolve_canonical_name(collection: str, name: str) -> str:
@@ -279,16 +541,31 @@ def store_extraction(collection: str, result: ExtractionResult, source_doc: str)
 
 # 파일 하나를 지정한 컬렉션(사업)으로 끝까지 처리한다 (변경 없으면 False, 처리했으면 True를 반환).
 # model로 추출 LLM 모델을, glean_rounds로 청크당 gleaning 라운드 수를 바꿀 수 있다(둘 다 없으면 설정 기본값).
+# backend별 auto 해소 대상 — 로컬/구독 백엔드는 구조화 출력 강제가 안 돼 분해 추출이 기본이다(계획 ④).
+_DECOMPOSED_AUTO_BACKENDS = ("ollama", "claude_cli", "codex_cli")
+
+
+# extraction_mode("auto"|"single"|"decomposed")를 실제 모드로 해소한다. single/decomposed는 backend와
+# 무관하게 강제. auto는 backend로 판단: 로컬/구독=decomposed(구조화 출력 강제 불가라 좁혀 물어야 함),
+# gemini/미지정=single(response_schema가 predicate 등을 이미 강제해줌).
+def _resolve_extraction_mode(mode: str, backend: str | None) -> str:
+    if mode in ("single", "decomposed"):
+        return mode
+    return "decomposed" if backend in _DECOMPOSED_AUTO_BACKENDS else "single"
+
+
 def process_file(
     file_path: Path,
     collection: str,
     model: str | None = None,
     glean_rounds: int | None = None,
     backend: str | None = None,
+    extraction_mode: str | None = None,
 ) -> bool:
     # backend=None/"gemini"이면 기존 Gemini 경로(RPD 한도 기록 포함). "ollama"/"claude_cli"는 로컬/구독이라
     # Gemini 일일 한도(RPD)에 안 잡히므로 record_api_usage를 건너뛴다(아래 _is_gemini 참조).
     _is_gemini = backend in (None, "gemini")
+    mode = _resolve_extraction_mode(extraction_mode or settings.extraction_mode, backend)
     content = file_path.read_text(encoding="utf-8")
     file_name = file_path.name
     content_hash = document_store.compute_hash(content)
@@ -317,13 +594,17 @@ def process_file(
         known_names = graph_manager.get_known_entity_names([collection])
         known_predicates = graph_manager.get_known_predicates([collection])
 
-        result = extract_chunk(chunk, known_names, known_predicates, model=model, backend=backend)
+        if mode == "decomposed":
+            # 분해 모드는 패스 분리 자체가 gleaning의 역할(놓친 것 캐기)을 이미 하므로 gleaning은 스킵한다(계획 ④).
+            result = extract_chunk_decomposed(chunk, known_names, known_predicates, model=model, backend=backend)
+        else:
+            result = extract_chunk(chunk, known_names, known_predicates, model=model, backend=backend)
+            # gleaning: 놓친 엔티티/관계를 몇 번 더 캐내 누적한다(옵트인, rounds>0일 때만).
+            if result is not None and rounds > 0:
+                result, calls = glean_chunk(chunk, result, rounds, model=model, backend=backend)
+                extra_calls += calls
         if result is None:
             continue
-        # gleaning: 놓친 엔티티/관계를 몇 번 더 캐내 누적한다(옵트인, rounds>0일 때만).
-        if rounds > 0:
-            result, calls = glean_chunk(chunk, result, rounds, model=model, backend=backend)
-            extra_calls += calls
         try:
             store_extraction(collection, result, source_id)
         except Exception as exc:

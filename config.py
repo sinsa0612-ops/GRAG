@@ -116,6 +116,15 @@ class Settings(BaseSettings):
     # 원하면 .env에서 ANSWER_BACKEND=gemini로 되돌린다(그때만 RPD 한도에 잡힌다). query --backend로 질의별 오버라이드 가능.
     answer_backend: str = "ollama"
 
+    # --- 분해 추출(decomposed extraction) 설정 — 로컬 모델(qwen3:14b) 과부하 회피 ---
+    # 단일패스로 "엔티티+관계 한번에"를 요구하면 로컬 모델이 구조를 무너뜨린다(정신아 누락·소유방향
+    # 역전·날짜 노이즈화 실측). 타입군별 엔티티 패스 → 관계 패스로 좁게 나눠 여러 번 물으면 회복된다.
+    # auto: backend가 ollama/claude_cli/codex_cli면 decomposed, gemini/None이면 single(구조화출력 강제 가능이라
+    # 단일패스 유지). single/decomposed를 명시하면 backend와 무관하게 강제한다.
+    extraction_mode: str = "auto"
+    # 분해 패스(엔티티 타입군 4개 + 관계 1개) LLM temperature. 0=결정적 — 노이즈 억제 실측 조건.
+    extraction_temperature: float = 0.0
+
     # --- 인제스트(추출) 기본 백엔드 ---
     # 외부 업로드 금지(완전 로컬)가 기본이라 ollama. 데이터를 Gemini로 보내도 되면 .env에서 INGEST_BACKEND=gemini로
     # 바꾸거나 `graphrag ingest --backend gemini`로 건별 옵트인(그때만 RPD 한도 적용). 이렇게 두면 아무 플래그 없이

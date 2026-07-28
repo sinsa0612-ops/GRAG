@@ -162,9 +162,12 @@ def cmd_ingest(args) -> None:
         _report_orphan_cleanup()
         _run_auto_merge(collection, args)
         return
+    extraction_mode = getattr(args, "extraction_mode", None)
     for path, _ in estimates:
         try:
-            changed = ingest.process_file(path, collection, glean_rounds=glean, backend=backend)
+            changed = ingest.process_file(
+                path, collection, glean_rounds=glean, backend=backend, extraction_mode=extraction_mode
+            )
         except Exception as exc:
             failed_dir = settings.failed_dir / collection
             failed_dir.mkdir(parents=True, exist_ok=True)
@@ -540,6 +543,10 @@ def main(argv: list[str] | None = None) -> None:
     p_ingest.add_argument(
         "--backend", choices=["gemini", "ollama", "claude_cli", "codex_cli"], default=None,
         help="추출 LLM 백엔드(기본: Gemini). ollama=로컬 무료(RPD 한도 미적용), claude_cli/codex_cli=구독.",
+    )
+    p_ingest.add_argument(
+        "--extraction-mode", choices=["auto", "single", "decomposed"], default=None,
+        help="추출 방식(기본: 설정값 auto). auto=로컬/구독 백엔드는 decomposed, gemini는 single.",
     )
     p_ingest.set_defaults(func=cmd_ingest)
 

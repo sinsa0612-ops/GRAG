@@ -465,3 +465,300 @@ def test_process_file_forwards_backend_to_generate(tmp_path, monkeypatch):
 
     ingest.process_file(file_path, C, backend="ollama")
     assert seen_backends and all(b == "ollama" for b in seen_backends)
+
+
+# --- 분해 추출(decomposed extraction) — implementation_plan.md ②~⑤ + PoC(poc_v2.py) 정식화 ---
+
+
+def test_is_noise_name_blocks_dates_percents_and_pure_numbers():
+    assert ingest._is_noise_name("1995년 2월 16일") is True
+    assert ingest._is_noise_name("27.6%") is True
+    assert ingest._is_noise_name("1,057만 명") is True
+    assert ingest._is_noise_name("1,057") is True
+    assert ingest._is_noise_name("") is True
+    assert ingest._is_noise_name("카카오") is False
+    assert ingest._is_noise_name("김범수") is False
+
+
+def test_reconcile_dedupes_entities_by_name_and_relations_by_triple():
+    from schemas import ExtractedEntity, ExtractedRelation
+
+    entities = [
+        ExtractedEntity(name="카카오", type="ORGANIZATION", description="회사"),
+        ExtractedEntity(name="카카오", type="ORGANIZATION", description="회사"),
+    ]
+    relations = [
+        ExtractedRelation(source="김범수", target="카카오", predicate="FOUNDED", valid_from="1998"),
+        ExtractedRelation(source="김범수", target="카카오", predicate="FOUNDED", valid_from="1998"),
+    ]
+    result = ingest._reconcile(entities, relations)
+
+    assert len(result.entities) == 2  # 카카오 dedup + 고아 김범수 승격
+    assert len(result.relations) == 1
+
+
+def test_reconcile_type_conflict_concrete_beats_other():
+    from schemas import ExtractedEntity
+
+    entities = [
+        ExtractedEntity(name="카카오", type="OTHER", description=""),
+        ExtractedEntity(name="카카오", type="ORGANIZATION", description="회사"),
+    ]
+    result = ingest._reconcile(entities, [])
+
+    assert len(result.entities) == 1
+    assert result.entities[0].type.value == "ORGANIZATION"
+    assert result.entities[0].description == "회사"
+
+
+def test_reconcile_type_conflict_between_two_concrete_types_keeps_first_and_warns(caplog):
+    from schemas import ExtractedEntity
+
+    entities = [
+        ExtractedEntity(name="카카오뱅크", type="ORGANIZATION", description="첫번째"),
+        ExtractedEntity(name="카카오뱅크", type="WORK", description="두번째"),
+    ]
+    with caplog.at_level("WARNING"):
+        result = ingest._reconcile(entities, [])
+
+    assert len(result.entities) == 1
+    assert result.entities[0].type.value == "ORGANIZATION"  # 먼저 것 유지
+    assert result.entities[0].description == "첫번째"
+    assert any("타입 충돌" in r.message for r in caplog.records)
+
+
+def test_reconcile_description_prefers_nonempty_then_first():
+    from schemas import ExtractedEntity
+
+    entities = [
+        ExtractedEntity(name="A", type="PERSON", description=""),
+        ExtractedEntity(name="A", type="PERSON", description="나중 설명"),
+    ]
+    result = ingest._reconcile(entities, [])
+    assert result.entities[0].description == "나중 설명"  # 앞이 비어있으면 뒤 것 채택
+
+
+def test_reconcile_adds_orphan_endpoint_as_other_and_keeps_relation():
+    # 성공기준 (b) 회귀 가드: 패스 A가 카카오를 놓쳤어도 패스 B의 관계가 죽지 않아야 한다.
+    from schemas import ExtractedEntity, ExtractedRelation
+
+    entities = [ExtractedEntity(name="김범수", type="PERSON", description="창업자")]
+    relations = [ExtractedRelation(source="김범수", target="카카오", predicate="FOUNDED", valid_from="1998")]
+
+    result = ingest._reconcile(entities, relations)
+
+    names = {e.name: e for e in result.entities}
+    assert "카카오" in names
+    assert names["카카오"].type.value == "OTHER"
+    assert len(result.relations) == 1
+
+
+def test_reconcile_drops_relation_when_orphan_endpoint_is_noise():
+    from schemas import ExtractedEntity, ExtractedRelation
+
+    entities = [ExtractedEntity(name="카카오", type="ORGANIZATION", description="")]
+    relations = [
+        ExtractedRelation(source="카카오", target="27.6%", predicate="OWNS", valid_from=""),
+    ]
+
+    result = ingest._reconcile(entities, relations)
+
+    assert result.relations == []
+    assert "27.6%" not in {e.name for e in result.entities}
+
+
+def test_reconcile_returns_valid_extraction_result_type():
+    from schemas import ExtractionResult
+
+    result = ingest._reconcile([], [])
+    assert isinstance(result, ExtractionResult)
+    assert result.entities == []
+    assert result.relations == []
+
+
+def test_extract_entities_pass_calls_all_type_groups_and_filters_noise(monkeypatch):
+    calls = []
+
+    def fake_generate(prompt, **kwargs):
+        idx = len(calls)
+        calls.append(prompt)
+        responses = [
+            {"entities": [{"name": "정신아", "type": "PERSON", "description": "대표"}]},
+            {"entities": [{"name": "카카오", "type": "ORGANIZATION", "description": ""}]},
+            {"entities": [{"name": "카카오톡", "type": "WORK", "description": ""}, {"name": "27.6%", "type": "OTHER"}]},
+            {"entities": [{"name": "판교", "type": "LOCATION", "description": ""}]},
+        ]
+        return json.dumps(responses[idx])
+
+    monkeypatch.setattr(ingest, "generate", fake_generate)
+
+    entities = ingest.extract_entities_pass("아무 텍스트")
+
+    assert len(calls) == 4  # 타입군 4개 = 4콜
+    names = {e.name for e in entities}
+    assert names == {"정신아", "카카오", "카카오톡", "판교"}  # 노이즈(27.6%)는 걸러짐
+
+
+def test_extract_entities_pass_partial_group_failure_keeps_others(monkeypatch):
+    def flaky_generate(prompt, **kwargs):
+        if '"PERSON"' in prompt:  # 사람 그룹만 실패시킨다(타입 리터럴로 그룹 식별, 문구 변경에 안전)
+            raise RuntimeError("일시적 오류")
+        return json.dumps({"entities": [{"name": "카카오", "type": "ORGANIZATION", "description": ""}]})
+
+    monkeypatch.setattr(ingest, "generate", flaky_generate)
+
+    entities = ingest.extract_entities_pass("아무 텍스트")
+
+    assert entities is not None
+    assert any(e.name == "카카오" for e in entities)
+
+
+def test_extract_entities_pass_returns_none_when_all_groups_fail(monkeypatch):
+    def boom(prompt, **kwargs):
+        raise RuntimeError("Ollama 다운")
+
+    monkeypatch.setattr(ingest, "generate", boom)
+
+    assert ingest.extract_entities_pass("아무 텍스트") is None
+
+
+def test_extract_relations_pass_skips_call_when_no_entities(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_generate(prompt, **kwargs):
+        calls["n"] += 1
+        return json.dumps({"relations": []})
+
+    monkeypatch.setattr(ingest, "generate", fake_generate)
+
+    result = ingest.extract_relations_pass("텍스트", [])
+
+    assert result == []
+    assert calls["n"] == 0
+
+
+def test_extract_relations_pass_injects_entity_list_and_direction_examples(monkeypatch):
+    captured = []
+
+    def fake_generate(prompt, **kwargs):
+        captured.append(prompt)
+        return json.dumps(
+            {"relations": [{"source": "김범수", "target": "카카오", "predicate": "FOUNDED", "valid_from": "1998"}]}
+        )
+
+    monkeypatch.setattr(ingest, "generate", fake_generate)
+
+    result = ingest.extract_relations_pass("텍스트", ["김범수", "카카오"], ["OWNS"])
+
+    assert "김범수, 카카오" in captured[0]
+    assert "FOUNDED" in captured[0]  # 방향 예시가 프롬프트에 콕 박혀 있어야 함
+    assert result[0].predicate == "FOUNDED"
+
+
+def test_extract_relations_pass_failure_returns_empty_list(monkeypatch):
+    def boom(prompt, **kwargs):
+        raise RuntimeError("일시적 오류")
+
+    monkeypatch.setattr(ingest, "generate", boom)
+
+    assert ingest.extract_relations_pass("텍스트", ["카카오"]) == []
+
+
+def test_extract_chunk_decomposed_orchestrates_passes_and_reconciles(monkeypatch):
+    def fake_generate(prompt, **kwargs):
+        if "[엔티티 목록]" in prompt:
+            return json.dumps(
+                {"relations": [{"source": "김범수", "target": "카카오", "predicate": "FOUNDED", "valid_from": ""}]}
+            )
+        if '"PERSON"' in prompt:
+            return json.dumps({"entities": [{"name": "김범수", "type": "PERSON", "description": ""}]})
+        return json.dumps({"entities": []})
+
+    monkeypatch.setattr(ingest, "generate", fake_generate)
+
+    result = ingest.extract_chunk_decomposed("아무 텍스트")
+
+    names = {e.name for e in result.entities}
+    assert {"김범수", "카카오"} <= names
+    assert result.relations[0].predicate == "FOUNDED"
+
+
+def test_extract_chunk_decomposed_returns_none_when_entity_pass_fails(monkeypatch):
+    def boom(prompt, **kwargs):
+        raise RuntimeError("전체 실패")
+
+    monkeypatch.setattr(ingest, "generate", boom)
+
+    assert ingest.extract_chunk_decomposed("아무 텍스트") is None
+
+
+def test_resolve_extraction_mode_auto_routes_by_backend():
+    assert ingest._resolve_extraction_mode("auto", "ollama") == "decomposed"
+    assert ingest._resolve_extraction_mode("auto", "claude_cli") == "decomposed"
+    assert ingest._resolve_extraction_mode("auto", "codex_cli") == "decomposed"
+    assert ingest._resolve_extraction_mode("auto", "gemini") == "single"
+    assert ingest._resolve_extraction_mode("auto", None) == "single"
+
+
+def test_resolve_extraction_mode_explicit_overrides_backend():
+    assert ingest._resolve_extraction_mode("single", "ollama") == "single"
+    assert ingest._resolve_extraction_mode("decomposed", "gemini") == "decomposed"
+
+
+def test_process_file_decomposed_mode_dispatches_to_extract_chunk_decomposed(tmp_path, monkeypatch):
+    calls = {"decomposed": 0, "single": 0, "glean": 0}
+    monkeypatch.setattr(
+        ingest, "extract_chunk_decomposed",
+        lambda *a, **k: calls.__setitem__("decomposed", calls["decomposed"] + 1) or ExtractionResultStub(),
+    )
+    monkeypatch.setattr(ingest, "extract_chunk", lambda *a, **k: calls.__setitem__("single", calls["single"] + 1))
+    monkeypatch.setattr(ingest, "glean_chunk", lambda *a, **k: calls.__setitem__("glean", calls["glean"] + 1))
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    ingest.process_file(file_path, C, backend="ollama", glean_rounds=3, extraction_mode="decomposed")
+
+    assert calls["decomposed"] == 1
+    assert calls["single"] == 0
+    assert calls["glean"] == 0  # 분해 모드는 gleaning을 스킵해야 한다(계획 ④)
+
+
+def test_process_file_single_mode_still_uses_extract_chunk_and_gleaning(tmp_path, monkeypatch):
+    calls = {"decomposed": 0, "single": 0, "glean": 0}
+    monkeypatch.setattr(
+        ingest, "extract_chunk_decomposed",
+        lambda *a, **k: calls.__setitem__("decomposed", calls["decomposed"] + 1) or ExtractionResultStub(),
+    )
+
+    def fake_extract_chunk(*a, **k):
+        calls["single"] += 1
+        return ExtractionResultStub()
+
+    def fake_glean_chunk(chunk, base, rounds, **k):
+        calls["glean"] += 1
+        return base, 1
+
+    monkeypatch.setattr(ingest, "extract_chunk", fake_extract_chunk)
+    monkeypatch.setattr(ingest, "glean_chunk", fake_glean_chunk)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    ingest.process_file(file_path, C, backend="gemini", glean_rounds=1, extraction_mode="auto")
+
+    assert calls["single"] == 1
+    assert calls["decomposed"] == 0
+    assert calls["glean"] == 1
+
+
+def ExtractionResultStub():
+    from schemas import ExtractionResult
+
+    return ExtractionResult(entities=[], relations=[])
