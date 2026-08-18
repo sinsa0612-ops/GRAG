@@ -127,6 +127,17 @@ _ENTITY_TYPE_GROUPS: dict[str, str] = {
     ),
 }
 
+# 타입군 분할을 끈(extraction_entity_type_split=False) 경우에 쓰는 통합 엔티티 프롬프트 — 4콜을 1콜로 줍인다.
+# 위 4개 그룹의 지시를 한 번에 담되 타입 목록을 명시해, 분할본과 같은 온톨로지로 답하게 한다.
+# 분할본보다 요구가 넓어 누락이 늘 수 있다(그래서 기본값은 분할) — 속도를 사는 옵션이다.
+_ENTITY_COMBINED_PROMPT = (
+    "다음 텍스트에 등장하는 모든 대상을 빠짐없이 뽑아라. "
+    "사람(직책·역할 포함), 조직·회사·기관·단체·정부·법인, 사물·제품·서비스·앱·작품·기술·개념·사건, "
+    "장소·지역·건물을 모두 포함한다. 날짜·숫자·비율은 넣지 마라. 이름은 가장 짧은 표준 명칭.\n"
+    'type은 다음 중 하나: PERSON|ORGANIZATION|LOCATION|OBJECT|WORK|CONCEPT|EVENT\n'
+    '순수 JSON만: {"entities":[{"name":"이름","type":"PERSON","description":"짧은 설명"}]}\n\n'
+)
+
 # 엔티티 패스 전용 어휘 힌트(이름만 — 이 패스는 관계를 뽑지 않아 predicate 힌트가 필요 없다).
 _ENTITY_PASS_VOCAB_HINT = """\
 이미 그래프에 쓰이고 있는 이름이야. 같은 대상이면 새로 만들지 말고 아래 표현을 정확히 그대로 재사용해.
@@ -157,18 +168,32 @@ predicate는 영어 대문자 스네이크. 가능하면 다음을 먼저 재사
 """
 
 
-# 날짜·비율·순수숫자 이름을 모델 지시와 무관하게 코드로 최종 차단한다(PoC 실측 노이즈 패턴 이식).
-# 모델 지시(프롬프트)만 믿지 않는다 — 엔티티 패스 파싱 시점과 _reconcile의 고아 끝점 승격 시점 둘 다에서 쓴다.
+# 숫자에 붙어 다니는 단위·조수사. 긴 것부터 지워야 "시간"이 "시"+"간"으로 쪼개지지 않는다.
+_NUMBER_UNITS = tuple(
+    sorted(
+        ("퍼센트", "시간", "억", "조", "만", "천", "백", "원", "달러", "명", "개", "주", "건",
+         "회", "배", "위", "년", "월", "일", "시", "분", "초", "%"),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+# 날짜·비율·수량 같은 '수치'가 엔티티로 올라오는 것을 모델 지시와 무관하게 코드로 최종 차단한다.
+# 판정 방식: 숫자가 든 이름에서 숫자·구분자·단위를 걷어내고 남는 게 없으면 그건 대상이 아니라 수치다.
+# 단위를 열거해 부분일치로 잡던 옛 방식은 열거에 없는 형태를 그대로 통과시켰다("1,057만" — "만 명"에는
+# 걸리지만 공백 없는 단위에는 안 걸림). 남는 글자를 보는 쪽이 열거 누락에 무너지지 않는다.
+# 숫자가 아예 없는 이름은 손대지 않는다 — "아이폰 15"·"코로나19"처럼 숫자를 품은 진짜 이름도
+# 잔여 글자가 남아 살아남는다. 엔티티 패스 파싱 시점과 _reconcile의 고아 끝점 승격 시점 둘 다에서 쓴다.
 def _is_noise_name(name: str) -> bool:
     if not name:
         return True
-    if "%" in name or "만 명" in name or "천원" in name:
-        return True
-    if re.search(r"\d", name) and re.search(r"(년|월|일)", name):  # "1995년 2월 16일" 류
-        return True
-    if re.fullmatch(r"[\d,.\s]+", name):  # 순수 숫자
-        return True
-    return False
+    if not re.search(r"\d", name):
+        return False
+    residue = re.sub(r"[\d,.\s]", "", name)
+    for unit in _NUMBER_UNITS:
+        residue = residue.replace(unit, "")
+    return residue == ""
 
 
 # 이미 그래프에 쓰인 이름/관계 어휘를 프롬프트 앞에 붙인다 (어휘 파편화 방지).
@@ -342,6 +367,7 @@ def _parse_entity_group(raw_text: str) -> list[ExtractedEntity]:
 
 
 # 패스 A(엔티티) — 청크 하나를 4개 타입군(_ENTITY_TYPE_GROUPS)으로 나눠 그룹마다 1콜씩 좁게 묻는다.
+# extraction_entity_type_split=False면 통합 프롬프트 1콜로 대신한다(콜 수↓, recall↓).
 # 그룹 하나가 실패(호출 오류/JSON 파싱 실패)해도 다른 그룹은 계속 진행한다 — 그룹 전부가 실패했을 때만
 # 이 청크를 통째로 건너뛴다(None 반환). 반환값은 dedup 전 원시 목록 — dedup/타입충돌은 _reconcile 소관.
 def extract_entities_pass(
@@ -352,7 +378,12 @@ def extract_entities_pass(
 ) -> list[ExtractedEntity] | None:
     entities: list[ExtractedEntity] = []
     ok_groups = 0
-    for group_label, instruction in _ENTITY_TYPE_GROUPS.items():
+    groups = (
+        _ENTITY_TYPE_GROUPS
+        if settings.extraction_entity_type_split
+        else {"통합": _ENTITY_COMBINED_PROMPT}
+    )
+    for group_label, instruction in groups.items():
         prompt = _build_entity_pass_prompt(instruction, chunk, known_names or [])
         try:
             raw_text = generate(
@@ -425,6 +456,37 @@ def extract_relations_pass(
         return []
 
 
+# 타입 충돌 우선순위 — 값이 작을수록 이긴다.
+# 좁게 물어본 그룹(사람/조직/장소)의 답이 '사물·작품·개념·사건' 포괄 그룹의 답을 이긴다. 포괄 그룹은
+# 질문 범위가 넓어 장소·인물까지 끌어오는 과잉 주장이 잦기 때문이다(제주도를 EVENT로 잡던 실측).
+# DATE는 엔티티로 승격시키지 않는 값이라 OTHER와 같은 최하위로 둔다.
+_TYPE_PRIORITY: dict[EntityType, int] = {
+    EntityType.PERSON: 0,
+    EntityType.ORGANIZATION: 0,
+    EntityType.LOCATION: 0,
+    EntityType.OBJECT: 1,
+    EntityType.WORK: 1,
+    EntityType.CONCEPT: 1,
+    EntityType.EVENT: 1,
+    EntityType.DATE: 2,
+    EntityType.OTHER: 2,
+}
+
+
+# 같은 이름이 두 타입군에서 다른 타입으로 올라왔을 때 어느 쪽을 남길지 정한다.
+# 우선순위가 다르면 순회 순서와 무관하게 좁은 쪽이 이긴다. 우선순위가 같은 진짜 충돌(예: PERSON vs
+# ORGANIZATION)은 먼저 온 쪽을 유지한다 — 어느 쪽이 옳은지 코드가 알 방법이 없다.
+# 둘 다 실질 타입인 충돌은 무엇이 버려졌는지 남긴다(OTHER가 낀 건 충돌이 아니라 보강이라 조용히 넘어간다).
+def _resolve_type_conflict(name: str, existing: EntityType, incoming: EntityType) -> EntityType:
+    if existing == incoming:
+        return existing
+    incoming_wins = _TYPE_PRIORITY[incoming] < _TYPE_PRIORITY[existing]
+    winner, loser = (incoming, existing) if incoming_wins else (existing, incoming)
+    if EntityType.OTHER not in (existing, incoming):
+        logger.warning("엔티티 타입 충돌: %s (%s 유지, %s 무시)", name, winner.value, loser.value)
+    return winner
+
+
 # 패스 A/B 결과를 하나의 ExtractionResult로 합치는 순수 함수(LLM 없음) — dedup·타입충돌·고아 끝점 처리.
 # 1) 엔티티는 이름(name) 키로 dedup. 타입 충돌: 구체 타입이 OTHER를 이기고, 둘 다 구체면 먼저 것을 유지하며
 #    경고를 남긴다. description은 비어있지 않은 쪽 우선, 둘 다 있으면 먼저 것.
@@ -442,11 +504,7 @@ def _reconcile(entities: list[ExtractedEntity], relations: list[ExtractedRelatio
         if existing is None:
             entity_map[entity.name] = entity
             continue
-        if existing.type != EntityType.OTHER and entity.type != EntityType.OTHER and existing.type != entity.type:
-            logger.warning(
-                "엔티티 타입 충돌: %s (%s 유지, %s 무시)", entity.name, existing.type.value, entity.type.value
-            )
-        winner_type = existing.type if existing.type != EntityType.OTHER else entity.type
+        winner_type = _resolve_type_conflict(entity.name, existing.type, entity.type)
         winner_desc = existing.description or entity.description
         entity_map[entity.name] = ExtractedEntity(name=entity.name, type=winner_type, description=winner_desc)
 

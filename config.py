@@ -130,6 +130,10 @@ class Settings(BaseSettings):
     extraction_mode: str = "auto"
     # 분해 패스(엔티티 타입군 4개 + 관계 1개) LLM temperature. 0=결정적 — 노이즈 억제 실측 조건.
     extraction_temperature: float = 0.0
+    # 엔티티 패스를 타입군 4개로 쪼개 물을지 여부. True면 청크당 5콜(엔티티 4 + 관계 1), False면 2콜.
+    # 기본 True인 이유는 이 분할이 로컬 모델의 과부하 누락을 되돌린 핵심이기 때문이다(PoC 4/4 회복).
+    # 속도가 더 급하고 recall을 조금 내줘도 되는 배치에서만 False로 낮춘다(콜 수 60% 감소).
+    extraction_entity_type_split: bool = True
 
     # --- 인제스트(추출) 기본 백엔드 ---
     # 외부 업로드 금지(완전 로컬)가 기본이라 ollama. 데이터를 Gemini로 보내도 되면 .env에서 INGEST_BACKEND=gemini로

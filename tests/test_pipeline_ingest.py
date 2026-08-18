@@ -480,6 +480,25 @@ def test_is_noise_name_blocks_dates_percents_and_pure_numbers():
     assert ingest._is_noise_name("김범수") is False
 
 
+# 단위가 공백 없이 숫자에 붙은 형태 — 옛 필터가 "만 명"만 알아서 그대로 통과시키던 구멍.
+def test_is_noise_name_blocks_korean_units_without_space():
+    assert ingest._is_noise_name("1,057만") is True
+    assert ingest._is_noise_name("3조원") is True
+    assert ingest._is_noise_name("5천억") is True
+    assert ingest._is_noise_name("2025년") is True
+    assert ingest._is_noise_name("13.30%") is True
+    assert ingest._is_noise_name("1시간 30분") is True
+
+
+# 숫자를 품었지만 진짜 이름인 것들은 살아남아야 한다(필터가 과하게 먹으면 실제 엔티티가 사라진다).
+def test_is_noise_name_keeps_real_names_containing_digits():
+    assert ingest._is_noise_name("아이폰 15") is False
+    assert ingest._is_noise_name("코로나19") is False
+    assert ingest._is_noise_name("카카오 T") is False
+    assert ingest._is_noise_name("제2공장") is False
+    assert ingest._is_noise_name("G7") is False
+
+
 def test_reconcile_dedupes_entities_by_name_and_relations_by_triple():
     from schemas import ExtractedEntity, ExtractedRelation
 
@@ -762,3 +781,47 @@ def ExtractionResultStub():
     from schemas import ExtractionResult
 
     return ExtractionResult(entities=[], relations=[])
+
+
+# 타입군 순회 순서(사람→조직→사물·개념→장소)가 결과를 가르면 안 된다. 포괄 그룹('사물·작품·개념·사건')이
+# 먼저 돌아 장소를 EVENT로 낚아채도, 좁게 물은 장소 그룹의 답이 이겨야 한다(제주도가 EVENT로 굳던 실측).
+def test_reconcile_narrow_type_beats_catch_all_regardless_of_order():
+    from schemas import ExtractedEntity
+
+    entities = [
+        ExtractedEntity(name="제주도", type="EVENT", description="포괄 그룹이 먼저 주장"),
+        ExtractedEntity(name="제주도", type="LOCATION", description="장소 그룹이 나중에 주장"),
+    ]
+    result = ingest._reconcile(entities, [])
+
+    assert result.entities[0].type.value == "LOCATION"
+
+    # 반대 순서로 들어와도 같은 결론이어야 한다(순서 무관 = 편향 없음).
+    result_reversed = ingest._reconcile(list(reversed(entities)), [])
+    assert result_reversed.entities[0].type.value == "LOCATION"
+
+
+# 타입군 분할 토글 — 계획에는 있었지만 구현이 빠져 4분할이 하드코딩돼 있던 항목.
+def test_entity_type_split_off_uses_single_combined_call(monkeypatch):
+    from config import settings
+
+    calls = []
+
+    def fake_generate(prompt, **kwargs):
+        calls.append(prompt)
+        return json.dumps(
+            {"entities": [
+                {"name": "정신아", "type": "PERSON", "description": "대표"},
+                {"name": "판교", "type": "LOCATION", "description": ""},
+            ]}
+        )
+
+    monkeypatch.setattr(ingest, "generate", fake_generate)
+    monkeypatch.setattr(settings, "extraction_entity_type_split", False)
+
+    entities = ingest.extract_entities_pass("아무 텍스트")
+
+    assert len(calls) == 1  # 4콜 → 1콜
+    assert {e.name for e in entities} == {"정신아", "판교"}
+    # 통합 프롬프트도 같은 온톨로지로 답하도록 타입 목록을 담고 있어야 한다.
+    assert "PERSON|ORGANIZATION|LOCATION" in calls[0]
