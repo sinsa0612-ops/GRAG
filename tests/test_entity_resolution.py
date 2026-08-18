@@ -204,3 +204,102 @@ def test_merge_records_dropped_name_as_alias(monkeypatch):
     survivor = (graph_manager.get_all_entities())[0]["name"]
     dropped = "Apple" if survivor == "애플" else "애플"
     assert graph_manager.find_canonical_name(C, dropped) == survivor
+
+
+# --- 검토 회색대(반자동 병합) ---
+# 실측 재현: 이름 임베딩만으로는 '합쳐야 하는 쌍'과 '합치면 안 되는 쌍'이 같은 점수대에 섞인다.
+# 그래서 회색대는 자동 판정하지 않고 승인 목록으로 나와야 한다.
+def _gray_band_embed_texts(texts):
+    # 국민연금공단(1,0) 기준: 기금 0.87(합쳐야 함), 건강보험공단 0.88(합치면 안 됨) — 역전 상황을 그대로 만든다.
+    # 공단을 기준축에 두고, 기금(0.87)·건강보험공단(0.88)을 반대편으로 벌려 서로는 0.53으로 떨어뜨린다
+    # — 회색대에 걸리는 쌍이 정확히 '공단↔기금'과 '공단↔건강보험공단' 둘뿐이게 만들기 위함.
+    table = {
+        "국민연금공단": [1.0, 0.0, 0.0, 0.0],
+        "국민연금기금": [0.87, 0.493, 0.0, 0.0],
+        "국민건강보험공단": [0.88, -0.475, 0.0, 0.0],
+        "고양이": [0.0, 0.0, 1.0, 0.0],
+        "카카오": [0.0, 0.0, 0.0, 1.0],
+    }
+    return [table[text] for text in texts]
+
+
+def _seed_gray_band():
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    graph_manager.upsert_entity(C, "국민연금공단", "ORGANIZATION", "카카오 주요 주주")
+    graph_manager.upsert_entity(C, "국민연금기금", "ORGANIZATION", "네이버 주요 주주")
+    graph_manager.upsert_entity(C, "고양이", "OTHER", "동물")
+    graph_manager.upsert_entity(C, "카카오", "ORGANIZATION", "IT 기업")
+    graph_manager.upsert_relation(C, "국민연금공단", "카카오", "HOLDS_STAKE", source_doc="kakao.md")
+
+
+def test_gray_band_pairs_are_not_auto_merged(monkeypatch):
+    monkeypatch.setattr(entity_resolution, "embed_texts", _gray_band_embed_texts)
+    _seed_gray_band()
+
+    # 0.87은 자동 병합 임계값(0.92) 아래라 자동으로는 합쳐지지 않아야 한다.
+    assert entity_resolution.find_merge_candidates(C) == []
+
+
+def test_find_review_candidates_surfaces_gray_band_with_context(monkeypatch):
+    monkeypatch.setattr(entity_resolution, "embed_texts", _gray_band_embed_texts)
+    _seed_gray_band()
+
+    reviews = entity_resolution.find_review_candidates(C)
+
+    pairs = {frozenset((r["keep"], r["drop"])) for r in reviews}
+    assert frozenset(("국민연금공단", "국민연금기금")) in pairs
+    assert all("고양이" not in pair for pair in pairs)
+
+    # 연결이 많은 쪽이 보존되고, 판단 근거(설명·관계)가 함께 실려야 사용자가 가를 수 있다.
+    review = next(r for r in reviews if r["drop"] == "국민연금기금")
+    assert review["keep"] == "국민연금공단"
+    assert review["keep_context"]["relations"] == ["국민연금공단 -[HOLDS_STAKE]-> 카카오"]
+    assert review["drop_context"]["description"] == "네이버 주요 주주"
+
+
+def test_review_approval_merges_and_rejection_is_remembered(monkeypatch):
+    monkeypatch.setattr(entity_resolution, "embed_texts", _gray_band_embed_texts)
+    monkeypatch.setattr(entity_resolution.backup_db, "create_backup", lambda: "(백업 생략)")
+    _seed_gray_band()
+    graph_manager.upsert_entity(C, "국민건강보험공단", "ORGANIZATION", "건강보험 운영")
+
+    entity_resolution.apply_review_decisions(
+        C,
+        approved=[("국민연금공단", "국민연금기금")],
+        rejected=[("국민연금공단", "국민건강보험공단")],
+    )
+
+    # 승인: 노드가 합쳐지고 사라진 표기는 alias로 남아 다음 문서에서 바로 같은 대상으로 인식된다.
+    assert graph_manager.get_entity(C, "국민연금기금") is None
+    assert "국민연금기금" in graph_manager.get_entity(C, "국민연금공단")["aliases"]
+    # 거부: 블랙리스트에 남아 다시 후보로 올라오지 않는다.
+    assert sqlite_manager.is_merge_blacklisted(C, "국민연금공단", "국민건강보험공단")
+    assert entity_resolution.find_review_candidates(C) == []
+
+
+# 실제 임베딩 모델(bge-m3)로 회색대 설계의 전제를 고정한다 — 가짜 벡터로는 증명되지 않는 부분.
+# 전제: '합쳐야 하는 쌍'(국민연금공단↔국민연금기금)과 '합치면 안 되는 쌍'(↔국민건강보험공단)의
+# 점수가 역전돼 있어, 임계값 하나로는 절대 갈리지 않는다. 그래서 둘 다 자동 병합이 아니라 검토로 가야 한다.
+# conftest.py가 이름의 real_embedding을 보고 GRAG_RUN_LLM_SMOKE=1 일 때만 실행한다.
+def test_gray_band_holds_for_real_korean_org_names_real_embedding():
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    for name, desc in (
+        ("국민연금공단", "카카오 주요 주주"),
+        ("국민연금기금", "네이버 주요 주주"),
+        ("국민건강보험공단", "건강보험 운영 기관"),
+    ):
+        graph_manager.upsert_entity(C, name, "ORGANIZATION", desc)
+
+    # 어느 쌍도 자동 병합되지 않는다 — 자동으로 합쳤다면 건강보험공단까지 삼켰을 것이다.
+    assert entity_resolution.find_merge_candidates(C) == []
+
+    reviews = entity_resolution.find_review_candidates(C)
+    pairs = {frozenset((r["keep"], r["drop"])) for r in reviews}
+    assert frozenset(("국민연금공단", "국민연금기금")) in pairs
+    assert frozenset(("국민연금공단", "국민건강보험공단")) in pairs
+
+    # 역전 확인: 합치면 안 되는 쌍이 합쳐야 하는 쌍보다 점수가 높다(= 기계가 가를 수 없다는 증거).
+    score = {frozenset((r["keep"], r["drop"])): r["score"] for r in reviews}
+    assert score[frozenset(("국민연금공단", "국민건강보험공단"))] > score[frozenset(("국민연금공단", "국민연금기금"))]

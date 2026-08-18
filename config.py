@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # 벡터 청크에 등장한 엔티티로 이 개수까지 채운다. 본문 매칭이 그래프를 무한정 부풀리지 않게 막는 상한.
     graph_context_max_entities: int = 20
     merge_similarity_threshold: float = 0.92
+    # 자동 병합 임계값 아래의 '검토 회색대' 하한. 이 값과 merge_similarity_threshold 사이의 쌍은
+    # 자동으로 합치지도, 조용히 버리지도 않고 사용자 승인 대기 목록(merge --review)에 올린다.
+    # 이름만 보는 임베딩으로는 이 구간을 기계가 가를 수 없다는 게 실측이다(bge-m3 기준):
+    #   합쳐야 하는 국민연금공단↔국민연금기금 0.870 < 합치면 안 되는 국민연금공단↔국민건강보험공단 0.874.
+    # 점수 분포가 겹치는 정도가 아니라 역전돼 있어, 임계값을 낮추는 처방은 오병합을 늘릴 뿐이다.
+    merge_review_threshold: float = 0.80
     # 컬렉션을 넘는 same_as 브릿지 '제안'에 쓰는 유사도 임계값. 교차 사업의 같은 대상은 설명이 조금씩
     # 달라 병합 임계값보다 약간 느슨하게 둔다. 제안만 하고 실제 연결은 사용자가 결정한다(자동 연결 아님).
     bridge_similarity_threshold: float = 0.90

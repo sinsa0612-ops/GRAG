@@ -324,12 +324,51 @@ def cmd_collections(args) -> None:
         _print_node(root, 0)
 
 
-# 엔티티 자동 병합(컬렉션 내)을 실행한다.
+# 회색대 후보 하나를 판단 근거와 함께 보여주고 y/n/s 답을 받는다. 입력이 끊기면(EOF) 건너뛴 것으로 본다.
+def _ask_review(candidate: dict) -> str:
+    keep, drop = candidate["keep"], candidate["drop"]
+    print(f"\n유사도 {candidate['score'] * 100:.1f}%  —  '{keep}' <- '{drop}' 로 합칠까요?")
+    for label, name in (("보존", keep), ("병합", drop)):
+        context = candidate[f"{'keep' if name == keep else 'drop'}_context"]
+        print(f"  [{label}] {name} (연결 {context['degree']}개) {context['description']}".rstrip())
+        for line in context["relations"]:
+            print(f"         · {line}")
+    try:
+        answer = input("  합치기[y] / 다른 대상[n] / 나중에[s] > ").strip().lower()
+    except EOFError:
+        return "s"
+    return answer if answer in ("y", "n", "s") else "s"
+
+
+# 엔티티 병합. 기본은 자동 병합(안전 임계값 초과)이고, --review는 그 아래 회색대를 사용자에게 물어본다.
+# 회색대를 자동 판정하지 않는 이유는 config.merge_review_threshold 주석 참조(임베딩 점수 분포가 역전됨).
 def cmd_merge(args) -> None:
+    from db import graph_manager
     from pipeline import entity_resolution
 
-    entity_resolution.run(_collections_from_args(args))
-    print("병합 작업 완료")
+    if not args.review:
+        entity_resolution.run(_collections_from_args(args))
+        print("병합 작업 완료")
+        return
+
+    for collection in _collections_from_args(args) or graph_manager.get_all_collections():
+        candidates = entity_resolution.find_review_candidates(collection)
+        if not candidates:
+            print(f"[{collection}] 검토할 후보가 없습니다.")
+            continue
+
+        print(f"\n=== [{collection}] 검토 후보 {len(candidates)}쌍 ===")
+        approved: list[tuple[str, str]] = []
+        rejected: list[tuple[str, str]] = []
+        for candidate in candidates:
+            answer = _ask_review(candidate)
+            if answer == "y":
+                approved.append((candidate["keep"], candidate["drop"]))
+            elif answer == "n":
+                rejected.append((candidate["keep"], candidate["drop"]))
+
+        entity_resolution.apply_review_decisions(collection, approved, rejected)
+        print(f"[{collection}] 병합 {len(approved)}쌍, 분리 확정 {len(rejected)}쌍(다시 묻지 않음).")
 
 
 # 설명 후보가 min_candidates개 이상 쌓인 엔티티만 로컬 LLM(기본 Ollama)으로 통합 요약한다(옵트인 배치, M1.5).
@@ -594,6 +633,11 @@ def main(argv: list[str] | None = None) -> None:
     p_merge = sub.add_parser("merge", help="엔티티 자동 병합(컬렉션 내)")
     p_merge.add_argument("--collection", help="범위 컬렉션(쉼표로 여러 개)")
     p_merge.add_argument("--all", action="store_true", help="전체 컬렉션")
+    p_merge.add_argument(
+        "--review",
+        action="store_true",
+        help="자동 병합 임계값 아래 '회색대' 후보를 하나씩 보여주고 승인받아 병합(다문서 표기 변형 대응)",
+    )
     p_merge.set_defaults(func=cmd_merge)
 
     p_summarize = sub.add_parser(

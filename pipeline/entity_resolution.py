@@ -31,9 +31,9 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"[\s\W_]+", "", strip_trailing_josa(name), flags=re.UNICODE).lower()
 
 
-# 한 컬렉션(사업) 안의 엔티티만 둘러보며 유사도 임계값을 넘는 병합 후보 쌍을 찾는다.
-# 병합은 컬렉션 내로만 일어난다 — 무관한 사업끼리 자동으로 엮이지 않게.
-def find_merge_candidates(collection: str) -> list[tuple[str, str, float]]:
+# 한 컬렉션 안의 엔티티 이름을 서로 비교해, keep_score가 참인 점수의 쌍만 돌려준다(블랙리스트는 제외).
+# 비교는 컬렉션 내로만 일어난다 — 무관한 사업끼리 자동으로 엮이지 않게.
+def _find_pairs(collection: str, keep_score) -> list[tuple[str, str, float]]:
     entities = graph_manager.get_all_entities([collection])
     if len(entities) < 2:
         return []
@@ -44,18 +44,23 @@ def find_merge_candidates(collection: str) -> list[tuple[str, str, float]]:
     vectors = embed_texts(texts)
     similarity_matrix = cosine_similarity(vectors)
 
-    candidates: list[tuple[str, str, float]] = []
+    pairs: list[tuple[str, str, float]] = []
     for i in range(len(entities)):
         for j in range(i + 1, len(entities)):
-            score = similarity_matrix[i][j]
-            if score <= settings.merge_similarity_threshold:
+            score = float(similarity_matrix[i][j])
+            if not keep_score(score):
                 continue
             name_a, name_b = entities[i]["name"], entities[j]["name"]
             if sqlite_manager.is_merge_blacklisted(collection, name_a, name_b):
                 logger.info("병합 예외 규칙 적용됨[%s]: %s / %s", collection, name_a, name_b)
                 continue
-            candidates.append((name_a, name_b, float(score)))
-    return candidates
+            pairs.append((name_a, name_b, score))
+    return pairs
+
+
+# 자동 병합해도 안전할 만큼 유사도가 높은(임계값 초과) 쌍만 찾는다.
+def find_merge_candidates(collection: str) -> list[tuple[str, str, float]]:
+    return _find_pairs(collection, lambda s: s > settings.merge_similarity_threshold)
 
 
 # 표기(공백·구두점·대소문자)만 다른 같은 이름들을 임베딩 없이 묶어 병합쌍 목록으로 만든다.
@@ -152,3 +157,83 @@ def run(collections: list[str] | None = None) -> None:
         logger.info("병합 후보가 없습니다.")
     else:
         logger.info("총 %d쌍의 노드를 병합했습니다.", total)
+
+
+# --- 검토 회색대(반자동 병합) — 이름만으로는 기계가 못 가르는 구간을 사람에게 넘긴다 ---
+# 배경(실측, bge-m3): 합쳐야 하는 "국민연금공단"↔"국민연금기금"(0.870)이 합치면 안 되는
+# "국민연금공단"↔"국민건강보험공단"(0.874)보다 점수가 낮다. 두 분포가 겹치는 게 아니라 역전이라
+# merge_similarity_threshold를 낮추는 처방은 교차문서 연결을 얻는 대신 오병합을 더 얻는다.
+# 그래서 회색대는 자동 판정하지 않고, 판단 근거(설명·관계)를 붙여 사용자 승인 목록으로 내보낸다.
+
+
+# 후보 노드가 뭘 하는 대상인지 한눈에 보이도록 설명과 대표 관계를 붙인다(사용자 판단 재료).
+def _entity_context(
+    name: str,
+    descriptions: dict[str, str],
+    relations: list[dict],
+    limit: int = 3,
+) -> dict:
+    lines = [
+        f"{r['source']} -[{r['predicate']}]-> {r['target']}"
+        for r in relations
+        if name in (r["source"], r["target"])
+    ]
+    return {
+        "description": descriptions.get(name, ""),
+        "relations": lines[:limit],
+        "degree": len(lines),
+    }
+
+
+# 자동 병합 임계값과 검토 하한 사이에 있는 쌍을, 사용자가 판단할 수 있는 맥락과 함께 돌려준다.
+# 보존(keep) 후보는 find_normalized_duplicates와 같은 규칙 — 연결이 많은 쪽, 동률이면 짧은 이름,
+# 그래도 같으면 사전순 앞 — 으로 결정적으로 고른다. 점수 높은 순 정렬.
+def find_review_candidates(collection: str) -> list[dict]:
+    pairs = _find_pairs(
+        collection,
+        lambda s: settings.merge_review_threshold < s <= settings.merge_similarity_threshold,
+    )
+    if not pairs:
+        return []
+
+    relations = graph_manager.get_all_relations([collection])
+    descriptions = {e["name"]: e.get("description") or "" for e in graph_manager.get_all_entities([collection])}
+    degree: dict[str, int] = {}
+    for relation in relations:
+        degree[relation["source"]] = degree.get(relation["source"], 0) + 1
+        degree[relation["target"]] = degree.get(relation["target"], 0) + 1
+
+    reviews: list[dict] = []
+    for name_a, name_b, score in pairs:
+        keep, drop = sorted((name_a, name_b), key=lambda n: (-degree.get(n, 0), len(n), n))
+        reviews.append(
+            {
+                "keep": keep,
+                "drop": drop,
+                "score": score,
+                "keep_context": _entity_context(keep, descriptions, relations),
+                "drop_context": _entity_context(drop, descriptions, relations),
+            }
+        )
+    return sorted(reviews, key=lambda r: -r["score"])
+
+
+# 사용자가 검토한 결과를 한 번에 반영한다.
+# 승인(approved)은 실제 병합 + alias 등록, 거부(rejected)는 병합 블랙리스트에 남겨 다시 묻지 않게 한다.
+# 실제로 병합할 게 있을 때만 되돌릴 수 있도록 안전 백업을 한 번 만든다(run()과 같은 규율).
+def apply_review_decisions(
+    collection: str,
+    approved: list[tuple[str, str]],
+    rejected: list[tuple[str, str]],
+) -> None:
+    if approved:
+        backup_path = backup_db.create_backup()
+        logger.info("검토 병합 전 안전 백업 생성: %s", backup_path)
+        for keep, drop in approved:
+            logger.info("검토 승인 병합[%s]: '%s' <- '%s'", collection, keep, drop)
+            graph_manager.add_alias(collection, keep, drop)
+            graph_manager.merge_entity_into(collection, keep_name=keep, drop_name=drop)
+        sqlite_manager.mark_communities_dirty(collection)
+
+    for name_a, name_b in rejected:
+        sqlite_manager.add_merge_blacklist(collection, name_a, name_b, "검토에서 다른 대상으로 확정")

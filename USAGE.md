@@ -103,6 +103,7 @@ graphrag status                        # 전체 현황
 graphrag status --collection 사업A      # 사업A 현황
 graphrag collections                   # 컬렉션 목록 + 각 문서/엔티티 수
 graphrag merge --collection 사업A       # 사업A 안에서 중복 엔티티 자동 병합(임베딩 유사도)
+graphrag merge --review --collection 사업A  # 자동 병합 아래 '회색대' 후보를 하나씩 확인받아 병합
 graphrag delete "메모.md" --collection 사업A   # 문서 삭제(벡터/관계/기록 + 고립 엔티티 정리)
 graphrag delete-collection 사업A               # 사업A를 통째로 삭제(엔티티 포함)
 graphrag backup                        # 전체 DB 백업 (최신 10개 자동 보관)
@@ -128,6 +129,20 @@ graphrag ingest "메모.md" --collection 사업A  # 올바른 컬렉션으로 �
 - 미리 `graphrag backup`을 해뒀다면 `graphrag restore`로 추출 직전 상태로 통째 되돌릴 수도 있습니다.
 
 - `merge`는 **컬렉션 안에서만** 병합합니다(사업 간 자동 병합 없음).
+
+#### 표기가 다른 같은 대상 합치기 (`merge --review`)
+문서마다 같은 대상을 다르게 부르면(“국민연금공단” / “국민연금기금”) 별개 노드로 갈라져 **문서 간 연결이 끊깁니다.**
+이걸 유사도 임계값만 낮춰 자동으로 잡을 수는 없습니다 — 실측(bge-m3)에서 **합쳐야 하는 쌍(0.870)이 합치면 안 되는
+쌍(국민연금공단↔국민건강보험공단, 0.874)보다 점수가 낮아** 두 분포가 역전돼 있기 때문입니다.
+그래서 이 구간은 기계가 판정하지 않고 사용자에게 묻습니다.
+```bash
+graphrag merge --review --collection IT기업
+```
+- 후보마다 **설명과 대표 관계**를 함께 보여줍니다 → `y` 합치기 / `n` 다른 대상 / `s` 나중에.
+- `y`는 병합하며 사라진 표기를 **별칭으로 저장**하니, 다음에 들어오는 문서가 그 표기를 써도 곧바로 같은 노드에 붙습니다.
+- `n`은 **병합 블랙리스트**에 남아 다시 묻지 않습니다.
+- 승인된 병합이 하나라도 있으면 실행 전에 **자동 백업**을 만들고, 해당 컬렉션의 커뮤니티는 재빌드 대상으로 표시됩니다.
+
 - 특정 두 이름이 자동 병합되지 않게 막으려면:
   ```bash
   python -c "from db import sqlite_manager; sqlite_manager.add_merge_blacklist('이름A','이름B','이유')"
