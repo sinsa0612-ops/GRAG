@@ -355,8 +355,9 @@ def test_reduce_preserves_subquery_and_source_labels(monkeypatch):
 
     assert result == "종합 답변"
     prompt = captured["prompt"]
-    assert "매출은?" in prompt  # 서브질문 라벨 보존
-    assert "comm-7" in prompt and "실적 리포트" in prompt  # 출처(community_id·title) 보존
+    assert "매출은?" in prompt  # 서브질문 라벨 보존(원질문과 다를 때만 붙는다)
+    assert C1 in prompt and "실적 리포트" in prompt  # 사람이 읽을 수 있는 출처(컬렉션·제목)는 보존
+    assert "comm-7" not in prompt  # 내부 식별자는 넣지 않는다 — 프롬프트에 들어가면 답변으로 샌다
     assert "매출이 늘었다" in prompt  # 근거 포인트 본문 보존
 
 
@@ -382,7 +383,9 @@ def test_global_all_irrelevant(monkeypatch):
 
     def fake_generate(prompt, backend=None, temperature=None, format_json=False):
         calls.append(prompt)
-        return json.dumps({"evidence_points": []})
+        if format_json:  # MAP — 아무 근거도 못 찾았다
+            return json.dumps({"evidence_points": []})
+        return query._NO_RELEVANT_MESSAGE  # REDUCE — 요약을 봐도 무관하다고 판단
 
     monkeypatch.setattr(query, "generate", fake_generate)
     monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
@@ -390,7 +393,10 @@ def test_global_all_irrelevant(monkeypatch):
     result = query.answer_question_global("질문?", collections=[C1])
 
     assert result == query._NO_RELEVANT_MESSAGE
-    assert len(calls) == 1  # MAP 1콜만 있고 REDUCE 호출은 없어야 함(낭비 호출 방지)
+    # MAP이 비워도 바로 포기하지 않는다 — 리포트 요약을 재료로 REDUCE가 한 번 더 판단한다(추가 MAP 콜 없음).
+    # "무관"을 리포트 하나만 보는 MAP이 아니라 전체를 보는 REDUCE가 확정하게 하려는 것.
+    assert len(calls) == 2
+    assert "요약" in calls[1]  # 폴백 재료 = 리포트 요약 본문
 
 
 # --- [D1 수리] MAP 실패가 사용자가 보는 반환 문자열에 각주로 드러나는지 ---
@@ -612,3 +618,44 @@ def test_relative_admission_widens_for_broad_questions_real_embedding():
     # 광역 질문은 세 소설을 모두 담아야 한다 — 고정 K였다면 하나가 잘려나가던 자리.
     assert {"hong", "bombom", "dongbaek"} <= {r["community_id"] for r in broad}
     assert len(broad) > len(narrow)
+
+
+# 분해가 일어나지 않으면(서브질문 == 원질문) 헤더에 서브질문 라벨을 붙이지 않는다 — 같은 문장을
+# 블록마다 반복해 넣으면 프롬프트만 길어지고 모델이 그 단위로 답을 쪼개게 만든다.
+def test_reduce_omits_subquery_label_when_not_decomposed(monkeypatch):
+    bundles = [
+        {"subquery": "원래 질문?", "collection": C1, "community_id": "comm-7",
+         "title": "실적 리포트", "points": ["매출이 늘었다"]}
+    ]
+    captured = {}
+    monkeypatch.setattr(query, "generate", lambda prompt, backend=None: captured.setdefault("prompt", prompt) and "")
+
+    query._reduce_evidence(bundles, "원래 질문?")
+
+    assert f"[{C1}/실적 리포트]" in captured["prompt"]
+
+
+# MAP이 전부 비었을 때 폴백이 리포트 요약을 REDUCE에 넘기는지 — "세 소설을 비교해줘"처럼 리포트 하나만
+# 봐서는 답할 수 없어 MAP이 정직하게 비우는 질문이 통째로 죽던 것을 막는 장치.
+def test_global_falls_back_to_report_summaries_when_map_empty(monkeypatch):
+    sqlite_manager.init_schema()
+    _seed_report(C1, "n1", 0, "첫째 소설", "첫째 소설의 줄거리")
+    _seed_report(C1, "n2", 0, "둘째 소설", "둘째 소설의 줄거리")
+    reduce_prompts = []
+
+    def fake_generate(prompt, backend=None, temperature=None, format_json=False):
+        if format_json:
+            return json.dumps({"evidence_points": []})
+        reduce_prompts.append(prompt)
+        return "두 소설을 비교한 답"
+
+    monkeypatch.setattr(query, "generate", fake_generate)
+    monkeypatch.setattr(query, "embed_texts", _ranked_embed_texts)
+
+    result = query.answer_question_global("두 소설을 비교해줘", collections=[C1])
+
+    assert result == "두 소설을 비교한 답"
+    assert len(reduce_prompts) == 1
+    # 두 리포트의 요약이 모두 재료로 들어가야 비교가 가능하다.
+    assert "첫째 소설의 줄거리" in reduce_prompts[0]
+    assert "둘째 소설의 줄거리" in reduce_prompts[0]

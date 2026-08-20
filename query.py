@@ -147,8 +147,13 @@ def answer_question(
 # 독립적으로 랭킹·MAP한다(한 서브질문이 다른 서브질문의 리포트를 밀어내지 않도록).
 
 _MAP_PROMPT = """\
-아래는 어떤 자료 묶음(커뮤니티)을 요약한 리포트다. 이 리포트에서 다음 질문에 답이 되는 근거 포인트만 뽑아줘.
-관련 내용이 없으면 빈 배열을 반환해. 리포트에 없는 내용은 지어내지 말고, 리포트에 쓰인 언어를 그대로 사용해.
+아래는 여러 자료 중 하나를 요약한 리포트다. 이 리포트에서 질문과 관련 있는 내용을 뽑아줘.
+
+이 리포트 하나만으로 질문에 완전히 답하지 못해도 괜찮다 — 지금은 다른 리포트에서 뽑은 것과 합쳐
+나중에 비교·종합할 재료를 모으는 단계다. 그러니 질문이 여러 대상의 공통점·비교·전체 주제를 묻더라도
+"이 리포트만으로는 알 수 없다"며 비우지 말고, 이 리포트가 말하는 몫을 뽑아라.
+질문과 정말 아무 상관이 없을 때만 빈 배열을 반환해.
+리포트에 없는 내용은 지어내지 말고, 리포트에 쓰인 언어를 그대로 사용해.
 
 리포트 제목: {title}
 리포트 요약: {summary}
@@ -160,17 +165,23 @@ _MAP_PROMPT = """\
 """
 
 _REDUCE_PROMPT = """\
-아래는 하나의 질문을 서브질문들로 나누어, 서로 다른 자료 묶음(커뮤니티)에서 뽑아낸 근거 포인트들이다.
-각 블록은 [서브질문|출처] 형식으로 어느 서브질문·어느 자료에서 나왔는지 표시되어 있다.
-이 근거들을 종합해 아래 질문에 대한 하나의 완결된 답변을 작성해줘. 근거에 없는 내용은 지어내지 말고,
-가능하면 어떤 서브질문·출처에 근거했는지 답변에 드러나게 해줘. 근거에 쓰인 언어를 그대로 사용해.
+아래는 질문에 답하려고 여러 자료에서 뽑아낸 근거 포인트들이다.
+대괄호는 그 근거가 어디서 나왔는지 표시할 뿐이다 — 답변을 그 단위로 나누지 마라.
+
+지킬 것:
+- 질문에 실제로 답하는 근거만 써라. 질문과 상관없는 블록은 통째로 버려라.
+- 자료 단위로 나열하지 말고, 같은 대상·주제끼리 묶어 하나의 흐름으로 종합해라.
+- "~자료에서는", "~묶음에서는", "각 자료별로", "커뮤니티" 같은 표현은 쓰지 마라.
+- 근거에 없는 내용은 지어내지 마라. 근거에 쓰인 언어를 그대로 사용해라.
+- 질문에 답하는 데 필요한 만큼만 써라. 남은 근거를 소진하려고 답을 늘리지 마라.
+- 근거가 질문과 정말 무관하면 억지로 답을 만들지 말고 "{no_answer}"라고만 써라.
 
 질문: {question}
 
 근거 포인트들:
 {evidence_blocks}
 
-위 근거들을 종합한 최종 답변만 작성해줘(다른 설명이나 머리말 없이 답변 본문만).
+답변 본문만 써라(머리말·맺음말·출처 목록 없이).
 """
 
 # 스코프에 리포트가 아예 없을 때(커뮤니티가 한 번도 안 빌드됨) 돌려주는 안내 문자열 — CLI/GUI가 별도
@@ -355,16 +366,39 @@ def _collect_evidence(subqueries: list[str], reports: list[dict]) -> tuple[list[
     return bundles, stats
 
 
+# MAP이 아무 근거도 못 준 질문을 위한 폴백 재료 — 랭킹이 뽑아준 리포트의 요약 자체를 근거로 삼는다.
+# MAP을 다시 부르지 않으므로 LLM 콜이 늘지 않는다(리포트 요약은 이미 DB에 있는 텍스트다).
+def _summary_bundles(question: str, reports: list[dict]) -> list[dict]:
+    return [
+        {
+            "subquery": question,
+            "collection": report["collection"],
+            "community_id": report["community_id"],
+            "title": report["title"],
+            "points": [report["summary"]],
+        }
+        for report in _select_reports(_rank_reports(question, reports))
+        if report.get("summary")
+    ]
+
+
 # REDUCE: 서브질문·출처 라벨이 붙은 근거 포인트 묶음들을 하나의 최종 답변으로 종합한다(LLM 1콜).
 # 호출부(answer_question_global)가 bundles가 비어 있지 않음을 이미 보장하므로 여기서는 항상 최소
 # 1건 이상을 받는다. backend가 "gemini"로 해석될 때만 RPD 사용량을 기록한다(MAP과 동일 원칙).
 def _reduce_evidence(bundles: list[dict], question: str) -> str:
+    # 블록 헤더에서 community_id를 뺐다 — "leaf1" 같은 내부 식별자는 사람에게 의미가 없는데 프롬프트에
+    # 들어가면 답변으로 새어나온다. 사람이 읽을 수 있는 컬렉션·리포트 제목만 남긴다.
+    # 서브질문은 원질문과 다를 때만(=분해가 실제로 일어났을 때만) 붙여 헤더 잡음을 줄인다.
     blocks = "\n\n".join(
-        f"[{b['subquery']}|출처={b['collection']}/{b['community_id']}/{b['title']}]\n"
+        f"[{b['collection']}/{b['title']}"
+        + (f"|{b['subquery']}" if b["subquery"] != question else "")
+        + "]\n"
         + "\n".join(f"- {point}" for point in b["points"])
         for b in bundles
     )
-    prompt = _REDUCE_PROMPT.format(question=question, evidence_blocks=blocks)
+    prompt = _REDUCE_PROMPT.format(
+        question=question, evidence_blocks=blocks, no_answer=_NO_RELEVANT_MESSAGE
+    )
     backend = settings.global_search_reduce_backend
     answer = generate(prompt, backend=backend)
     if backend in (None, "gemini"):
@@ -389,6 +423,13 @@ def answer_question_global(
         return _NO_REPORTS_MESSAGE
     subqueries = _decompose_question(question)
     bundles, stats = _collect_evidence(subqueries, reports)
+    if not bundles:
+        # MAP이 리포트를 하나씩 고립시켜 보기 때문에, 여러 대상을 견줘야 하는 질문("세 소설을 비교해줘")은
+        # 리포트마다 "이것만으로는 답할 수 없다"며 전부 비워 재료가 0이 된다 — 비교는 원래 전체를 보는
+        # REDUCE만 할 수 있는 일이라, 그 판단을 MAP에 맡긴 것이 잘못이었다. 그래서 재료가 0이면 포기하지
+        # 않고 리포트 요약을 그대로 근거로 넘겨 REDUCE가 판단하게 한다(추가 LLM 콜 0 — 이미 가진 텍스트다).
+        # 질문이 진짜로 무관한 경우를 위해 REDUCE 프롬프트가 "무관하면 못 찾았다고만 답하라"고 지시한다.
+        bundles = _summary_bundles(question, reports)
     answer = _NO_RELEVANT_MESSAGE if not bundles else _reduce_evidence(bundles, question)
     # [D1 수리] MAP 실패가 하나라도 있으면 그 사실을 답변 뒤에 명시한다(실패 0건이면 바이트 동일 유지).
     if stats["failed"] > 0:
