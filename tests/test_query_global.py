@@ -1,7 +1,7 @@
 # 글로벌(map-reduce) 검색(query.answer_question_global, M4)을 mock 백엔드로 단위검증한다.
 # [글로벌 검색 재설계] 관문을 LLM 채점에서 결정적 임베딩 랭킹으로, MAP을 "채점"에서 "증거추출"로,
 # 복합질문을 코드 결정적 분해로 바꿨다 — 이 파일도 새 흐름(_decompose_question/_cosine_rank/
-# _rank_reports/_select_top_k/_map_report_evidence/_collect_evidence/_reduce_evidence)에 맞춰 갱신했다.
+# _rank_reports/_select_reports/_map_report_evidence/_collect_evidence/_reduce_evidence)에 맞춰 갱신했다.
 # generate·embed_texts는 항상 mock으로 차단해 네트워크 없이 1초 내 종료된다(실 Ollama 통합은 맨 끝
 # skipif 스모크로 격리).
 import json
@@ -153,17 +153,38 @@ def test_rank_reports_orders_by_similarity_and_excludes_query(monkeypatch):
     assert len(ranked) == 4  # 질의 벡터(vectors[0])가 리포트로 새어들지 않음(vectors[1:] 슬라이싱)
 
 
-# --- 순수 함수: top-K 하한 강제(_select_top_k) ---
+# --- 순수 함수: 상대 기준 투입(_select_reports) ---
 
 
-def test_select_top_k_enforces_floor(monkeypatch):
-    monkeypatch.setattr(settings, "global_search_top_k", 1)
+def _ranked(scores: list[float]) -> list[dict]:
+    return [{"id": i, query._RANK_SCORE_KEY: s} for i, s in enumerate(scores)]
+
+
+def test_select_reports_admits_by_relative_score(monkeypatch):
+    monkeypatch.setattr(settings, "global_search_relative_ratio", 0.5)
+    monkeypatch.setattr(settings, "global_search_min_reports", 1)
+    monkeypatch.setattr(settings, "global_search_max_reports", 100)
+
+    # 1위가 압도적인 '좁은 질문' 모양 — 기준(1.0*0.5=0.5) 미만은 잘린다.
+    assert len(query._select_reports(_ranked([1.0, 0.9, 0.45, 0.2]))) == 2
+    # 점수가 몰려 있는 '광역 질문' 모양 — 같은 규칙인데 폭이 저절로 넓어진다.
+    assert len(query._select_reports(_ranked([0.5, 0.48, 0.46, 0.44]))) == 4
+
+
+def test_select_reports_enforces_floor_and_cap(monkeypatch):
+    monkeypatch.setattr(settings, "global_search_relative_ratio", 0.9)
     monkeypatch.setattr(settings, "global_search_min_reports", 3)
-    ranked_10 = [{"id": i} for i in range(10)]
-    ranked_2 = [{"id": i} for i in range(2)]
+    monkeypatch.setattr(settings, "global_search_max_reports", 100)
 
-    assert len(query._select_top_k(ranked_10)) == 3  # top_k=1이어도 하한 3까지는 뽑음
-    assert len(query._select_top_k(ranked_2)) == 2  # 리포트가 하한보다 적으면 전량
+    # 기준이 빡세도 하한만큼은 무조건 투입("재료 0" 방지). 리포트가 하한보다 적으면 전량.
+    assert len(query._select_reports(_ranked([1.0, 0.2, 0.1, 0.05]))) == 3
+    assert len(query._select_reports(_ranked([1.0, 0.2]))) == 2
+    assert query._select_reports([]) == []
+
+    # 상한은 기준을 통과한 것도 자른다(로컬 모델 폭주 방지).
+    monkeypatch.setattr(settings, "global_search_relative_ratio", 0.1)
+    monkeypatch.setattr(settings, "global_search_max_reports", 4)
+    assert len(query._select_reports(_ranked([1.0] * 10))) == 4
 
 
 # --- MAP: 증거추출(_map_report_evidence, generate 목킹) ---
@@ -245,14 +266,16 @@ def test_map_evidence_skips_parse_failure_and_continues(monkeypatch):
     assert stats == {"examined": 2, "calls": 2, "failed": 1}
 
 
-# --- 서브질문별 독립 top-K(_collect_evidence) ---
+# --- 서브질문별 독립 랭킹(_collect_evidence) ---
 
 
 def test_collect_evidence_ranks_per_subquery(monkeypatch):
-    # top_k=1·min_reports=1로 좁혀, 서브질문마다 실제로 다른 리포트 1개씩만 뽑히는지 확인한다
+    # 기준을 최대로 좁혀(ratio=1.0·하한 1) 서브질문마다 1등 1개씩만 뽑히게 한 뒤, 서로 다른 리포트가
+    # 나오는지 확인한다
     # (전역 K가 아니라 서브질문별 독립 랭킹 — A질문이 B리포트를 밀어내지 않아야 한다).
-    monkeypatch.setattr(settings, "global_search_top_k", 1)
+    monkeypatch.setattr(settings, "global_search_relative_ratio", 1.0)
     monkeypatch.setattr(settings, "global_search_min_reports", 1)
+    monkeypatch.setattr(settings, "global_search_max_reports", 100)
     reports = [
         {"collection": C1, "community_id": "a", "title": "A주제 리포트", "summary": "A 내용"},
         {"collection": C1, "community_id": "b", "title": "B주제 리포트", "summary": "B 내용"},
@@ -282,7 +305,7 @@ def test_collect_evidence_ranks_per_subquery(monkeypatch):
     titles_by_subquery = {b["subquery"]: b["title"] for b in bundles}
     assert titles_by_subquery["A질문"] == "A주제 리포트"
     assert titles_by_subquery["B질문"] == "B주제 리포트"
-    assert len(bundles) == 2  # 서브질문마다 정확히 1개씩(top_k=1) — 서로 밀어내지 않음
+    assert len(bundles) == 2  # 서브질문마다 정확히 1개씩(1등만) — 서로 밀어내지 않음
     assert stats["failed"] == 0  # 전부 정상 응답이라 실패 0건
 
 
@@ -558,3 +581,34 @@ def test_answer_question_global_deterministic_non_empty_real_ollama():
         )
         assert answer and answer not in (query._NO_REPORTS_MESSAGE, query._NO_RELEVANT_MESSAGE)
         print(f"\n[Ollama 글로벌 검색 {i + 1}회차 답변] {answer!r}")
+
+
+# 실제 임베딩(bge-m3)으로 상대 기준의 핵심 성질을 고정한다 — 가짜 점수로는 증명되지 않는 부분.
+# 성질: 같은 코퍼스·같은 규칙인데도 '좁은 질문'은 좁게, '광역 질문'은 넓게 투입된다.
+# 옛 고정 K는 이 둘을 같은 폭으로 다뤄, 광역 질문에서 정작 답을 담은 리포트를 잘라냈다(실측 6~13위).
+# conftest.py가 이름의 real_embedding을 보고 GRAG_RUN_LLM_SMOKE=1 일 때만 실행한다.
+def test_relative_admission_widens_for_broad_questions_real_embedding():
+    reports = [
+        {"collection": C1, "community_id": "hong", "title": "홍길동과 활빈당",
+         "summary": "홍길동은 조선시대의 서자 출신 의적으로 활빈당을 이끌고 탐관오리의 재물을 빼앗아 백성에게 나눠주었다."},
+        {"collection": C1, "community_id": "bombom", "title": "봄봄의 데릴사위",
+         "summary": "봄봄에서 '나'는 점순이와 혼인시켜 준다는 장인의 약속만 믿고 삼 년 넘게 머슴처럼 일한다."},
+        {"collection": C1, "community_id": "dongbaek", "title": "동백꽃의 점순이",
+         "summary": "동백꽃에서 점순이는 감자를 건네지만 거절당하자 우리 집 닭을 괴롭힌다."},
+        {"collection": C1, "community_id": "kakao", "title": "카카오의 성장",
+         "summary": "카카오는 김범수가 창업했고 다음커뮤니케이션과 합병했다."},
+        {"collection": C1, "community_id": "weather", "title": "날씨 기록",
+         "summary": "지난주 기온은 평년보다 높았고 주말에 비가 내렸다."},
+        {"collection": C1, "community_id": "recipe", "title": "김치찌개 조리법",
+         "summary": "돼지고기와 신김치를 볶다가 물을 붓고 두부와 대파를 넣어 끓인다."},
+    ]
+
+    narrow = query._select_reports(query._rank_reports("카카오는 누가 창업했어?", reports))
+    broad = query._select_reports(query._rank_reports("각 소설의 주요 인물과 관계를 정리해줘", reports))
+
+    # 좁은 질문은 정답이 1등이고 폭이 좁다.
+    assert narrow[0]["community_id"] == "kakao"
+    assert len(narrow) < len(reports)
+    # 광역 질문은 세 소설을 모두 담아야 한다 — 고정 K였다면 하나가 잘려나가던 자리.
+    assert {"hong", "bombom", "dongbaek"} <= {r["community_id"] for r in broad}
+    assert len(broad) > len(narrow)

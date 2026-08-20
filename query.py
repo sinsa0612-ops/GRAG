@@ -238,32 +238,57 @@ def _decompose_question(question: str) -> list[str]:
 # 질의 벡터와 각 리포트 벡터의 코사인 유사도를 내림차순으로 매겨 리포트 인덱스 리스트를 돌려준다.
 # embed_texts가 정규화 안 된 벡터를 반환하므로 여기서 직접 정규화한다. 순수 함수 — 같은 입력은 항상
 # 같은 순서를 낸다(결정성이 이번 신뢰성 수정의 핵심 전제).
-def _cosine_rank(query_vec: list[float], report_vecs: list[list[float]]) -> list[int]:
+def _cosine_scores(query_vec: list[float], report_vecs: list[list[float]]) -> list[float]:
     query = np.asarray(query_vec, dtype=float)
     query = query / (np.linalg.norm(query) or 1.0)
     matrix = np.asarray(report_vecs, dtype=float)
     norms = np.linalg.norm(matrix, axis=1)
     norms[norms == 0] = 1.0
-    similarities = (matrix / norms[:, None]) @ query
-    return [int(i) for i in np.argsort(-similarities)]
+    return [float(s) for s in (matrix / norms[:, None]) @ query]
+
+
+def _cosine_rank(query_vec: list[float], report_vecs: list[list[float]]) -> list[int]:
+    scores = _cosine_scores(query_vec, report_vecs)
+    return [int(i) for i in np.argsort(-np.asarray(scores))]
 
 
 # 서브질문 하나에 대해 스코프 내 리포트를 임베딩 코사인 유사도 내림차순으로 정렬해 돌려준다. 질문과
 # 모든 리포트 텍스트(title+summary)를 한 번의 embed_texts 콜로 함께 인코딩해 호출 수를 아낀다.
+# 유사도는 _RANK_SCORE_KEY로 각 리포트 사본에 실어 보낸다 — 뒤이어 _select_reports가 '상위 몇 개'가
+# 아니라 '최고점 대비 얼마나 가까운가'로 자르기 때문에 순서만으로는 부족하다. 원본 dict는 건드리지 않는다.
+_RANK_SCORE_KEY = "_rank_score"
+
+
 def _rank_reports(subquery: str, reports: list[dict]) -> list[dict]:
     texts = [f"{r['title']}\n{r['summary']}" for r in reports]
     vectors = embed_texts([subquery] + texts)
     query_vec, report_vecs = vectors[0], vectors[1:]
+    scores = _cosine_scores(query_vec, report_vecs)
     order = _cosine_rank(query_vec, report_vecs)
-    return [reports[i] for i in order]
+    return [{**reports[i], _RANK_SCORE_KEY: scores[i]} for i in order]
 
 
-# 랭킹된 리포트 중 상위 K개를 자른다. K는 설정 top_k와 min_reports 중 큰 쪽이며, 리포트 총수보다
-# 클 수 없다(리포트가 하한보다 적으면 전량 MAP에 투입). 랭킹이 부정확해도 최소 하한만큼은 무조건
-# MAP에 들어가게 해 "재료 0" 실패를 막는 강제 admission의 핵심 지점이다.
-def _select_top_k(ranked: list[dict]) -> list[dict]:
-    effective_k = min(len(ranked), max(settings.global_search_min_reports, settings.global_search_top_k))
-    return ranked[:effective_k]
+# 랭킹된 리포트 중 '최고 유사도 * relative_ratio' 이상인 것을 전부 MAP에 투입한다.
+# 고정 개수(K)를 쓰지 않는 이유는 질문마다 필요한 폭이 다르기 때문이다 — 좁은 질문은 1위가 압도적으로
+# 튀어 소수만 걸리고, 광역 질문은 점수가 몰려 있어 다수가 걸린다(config.global_search_relative_ratio 참조).
+# 하한(min_reports)은 "재료 0" 실패를 막고, 상한(max_reports)은 로컬 모델에서 광역 질문 하나가
+# 무한정 길어지는 것을 막는다. 상한에 걸려 잘릴 때는 몇 개를 버렸는지 남긴다(조용한 절단 금지).
+def _select_reports(ranked: list[dict]) -> list[dict]:
+    if not ranked:
+        return []
+    cutoff = ranked[0].get(_RANK_SCORE_KEY, 0.0) * settings.global_search_relative_ratio
+    admitted = [r for r in ranked if r.get(_RANK_SCORE_KEY, 0.0) >= cutoff]
+    if len(admitted) < settings.global_search_min_reports:
+        admitted = ranked[: settings.global_search_min_reports]
+    if len(admitted) > settings.global_search_max_reports:
+        logger.warning(
+            "MAP 투입 상한(%d) 적용 — 기준을 넘은 리포트 %d개 중 %d개를 제외했습니다.",
+            settings.global_search_max_reports,
+            len(admitted),
+            len(admitted) - settings.global_search_max_reports,
+        )
+        admitted = admitted[: settings.global_search_max_reports]
+    return admitted
 
 
 # MAP: 리포트 하나 + 서브질문 하나로 "근거 포인트 추출" LLM 1콜을 던진다. temperature=0 + JSON 강제로
@@ -308,7 +333,7 @@ def _collect_evidence(subqueries: list[str], reports: list[dict]) -> tuple[list[
     calls = 0
     failed = 0
     for subquery in subqueries:
-        for report in _select_top_k(_rank_reports(subquery, reports)):
+        for report in _select_reports(_rank_reports(subquery, reports)):
             calls += 1
             examined.add((report["collection"], report["community_id"]))
             points = _map_report_evidence(report, subquery)
