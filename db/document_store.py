@@ -177,8 +177,10 @@ def delete_collection(collection: str) -> int:
 
 
 # SQLite에 더 이상 기록되지 않은 source_id(= 처리 중간에 실패해서 추적이 끊긴 데이터)를 찾는다.
+# 재개 가능 인제스트(B)의 진행 중(in-flight) source_id는 아직 documents에 없지만 고아도 아니므로
+# 유효 집합에 합집합해 보호한다 — 안 하면 크래시와 재개 사이에 cleanup이 돌 때 부분 데이터가 삭제된다.
 def find_orphaned_source_ids() -> set[str]:
-    valid_ids = sqlite_manager.get_all_source_ids()
+    valid_ids = sqlite_manager.get_all_source_ids() | sqlite_manager.get_inflight_source_ids()
     referenced_ids = vector_manager.get_all_source_ids() | graph_manager.get_all_source_docs()
     return referenced_ids - valid_ids
 

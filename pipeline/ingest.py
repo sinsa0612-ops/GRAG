@@ -26,6 +26,10 @@ _SEED_PREDICATES = ", ".join(
         "CREATED", "PRODUCES", "USES", "PARTICIPATED_IN", "OCCURRED_ON",
         "HAS_ROLE", "AFFILIATED_WITH", "CAUSES", "RELATED_TO",
         "FOUNDED", "ACQUIRED", "MERGED_WITH", "SPUN_OFF", "HOLDS_STAKE", "OPERATES",
+        # 인물·생활 관계. 기업 어휘만 있으면 서사 텍스트에서 담을 그릇이 없어 관계가 통째로 비어버린다
+        # (실측: 봄봄 8청크에서 관계 0개 — 데릴사위·혼약·머슴살이를 넣을 predicate가 없었다).
+        "PARENT_OF", "SPOUSE_OF", "BETROTHED_TO", "SIBLING_OF", "WORKS_FOR",
+        "LIVES_IN", "FRIEND_OF", "LIKES", "CONFLICTS_WITH", "PROMISED_TO",
     ]
 )
 
@@ -108,7 +112,12 @@ _ENTITY_TYPE_GROUPS: dict[str, str] = {
     "사람": (
         '다음 텍스트에 등장하는 모든 "사람(인물)"을 그 직책·역할과 함께 빠짐없이 뽑아라. '
         "사람이 아닌 것은 넣지 마라.\n"
-        '순수 JSON만: {"entities":[{"name":"이름","type":"PERSON","description":"직책/역할"}]}\n\n'
+        '이야기를 "나/내/저"로 이끄는 1인칭 화자(주인공)도 반드시 한 사람으로 뽑아라. '
+        '그 화자의 이름이 텍스트에 따로 없으면 name을 "나"로 쓰고 description에 "1인칭 서술자"라고 적어라.\n'
+        "같은 대상을 여러 호칭(예: 장인/빙장/봉필씨)으로 부르면 반드시 하나로 묶어라. "
+        "대표 이름 하나만 name에 쓰고, 나머지 호칭은 전부 aliases 배열에 넣어라(없으면 빈 배열).\n"
+        '순수 JSON만: {"entities":[{"name":"장인","aliases":["빙장","봉필씨"],"type":"PERSON",'
+        '"description":"직책/역할"}]}\n\n'
     ),
     "조직·집단": (
         '다음 텍스트에 등장하는 모든 "조직·회사·기관·단체·정부·법인"을 빠짐없이 뽑아라. '
@@ -130,12 +139,17 @@ _ENTITY_TYPE_GROUPS: dict[str, str] = {
 # 타입군 분할을 끈(extraction_entity_type_split=False) 경우에 쓰는 통합 엔티티 프롬프트 — 4콜을 1콜로 줍인다.
 # 위 4개 그룹의 지시를 한 번에 담되 타입 목록을 명시해, 분할본과 같은 온톨로지로 답하게 한다.
 # 분할본보다 요구가 넓어 누락이 늘 수 있다(그래서 기본값은 분할) — 속도를 사는 옵션이다.
+# [ASSUMPTION·범위결정] coreference 지시는 사람에만 건다 — 조직·사물 호칭 변형은 A/B 근거가 없고
+# 서로 다른 조직을 우연히 엮을 위험(카카오/카카오뱅크류)이 이득보다 크다(implementation_plan.md §과제1.2).
 _ENTITY_COMBINED_PROMPT = (
     "다음 텍스트에 등장하는 모든 대상을 빠짐없이 뽑아라. "
     "사람(직책·역할 포함), 조직·회사·기관·단체·정부·법인, 사물·제품·서비스·앱·작품·기술·개념·사건, "
     "장소·지역·건물을 모두 포함한다. 날짜·숫자·비율은 넣지 마라. 이름은 가장 짧은 표준 명칭.\n"
+    '이야기를 "나/내/저"로 이끄는 1인칭 화자(주인공)도 반드시 한 사람으로 뽑아라(이름이 없으면 name을 "나"로).\n'
+    "사람은 같은 대상을 여러 호칭으로 부르면 반드시 하나로 묶어라. 대표 이름 하나만 name에 쓰고 "
+    "나머지 호칭은 aliases 배열에 넣어라(사람이 아닌 대상은 aliases를 비워둬도 된다).\n"
     'type은 다음 중 하나: PERSON|ORGANIZATION|LOCATION|OBJECT|WORK|CONCEPT|EVENT\n'
-    '순수 JSON만: {"entities":[{"name":"이름","type":"PERSON","description":"짧은 설명"}]}\n\n'
+    '순수 JSON만: {"entities":[{"name":"장인","aliases":["빙장"],"type":"PERSON","description":"짧은 설명"}]}\n\n'
 )
 
 # 엔티티 패스 전용 어휘 힌트(이름만 — 이 패스는 관계를 뽑지 않아 predicate 힌트가 필요 없다).
@@ -156,6 +170,24 @@ _RELATION_PASS_PROMPT = """\
 - 인수: 인수한 쪽이 source. 예) 카카오 -[ACQUIRED]-> 로엔엔터테인먼트
 - 분사: 모체가 source. 예) 카카오 -[SPUN_OFF]-> 카카오모빌리티
 - 운영: 운영 주체가 source. 예) 카카오모빌리티 -[OPERATES]-> 카카오 T
+- 부모/자식: 윗사람이 source. 예) 아버지 -[PARENT_OF]-> 아들
+- 혼인/약혼: 예) 철수 -[BETROTHED_TO]-> 영희
+- 사람 밑에서 일함: 일하는 쪽이 source. 예) 머슴 -[WORKS_FOR]-> 주인
+- 거주/체류: 사는 쪽이 source. 예) 노인 -[LIVES_IN]-> 마을
+- 약속: 약속한 쪽이 source. 예) 장인 -[PROMISED_TO]-> 사위
+- 갈등/다툼: 예) 형 -[CONFLICTS_WITH]-> 동생
+
+위 예시는 '방향'을 보여주려는 것일 뿐 허용 목록이 아니다. 소설·일기·기사 등 어떤 글이든
+그 글이 실제로 말하는 관계를 뽑아라. 기업 관계가 아니어도 된다 — 사람과 사람, 사람과 장소·사물
+사이의 관계도 모두 대상이다.
+
+지킬 것(어기면 그래프가 못 쓰게 된다):
+- 텍스트에 그렇게 적혀 있는 관계만 뽑아라. 같은 문장·같은 목록에 나왔다는 이유만으로 잇지 마라.
+  근거 문장을 댈 수 없으면 그 관계는 넣지 마라.
+- 한 쌍 사이에는 가장 정확한 관계 하나만 남겨라. 같은 두 대상을 여러 predicate로 중복해 잇지 마라.
+- 확실한 게 없으면 적게 뽑아라. 빈 배열도 정답이다 — 억지로 채우지 마라.
+- RELATED_TO는 구체 관계가 정말 없을 때만 쓰는 최후의 수단이다.
+- 같은 대상의 다른 호칭끼리 잇지 마라(예: '장인님'과 '빙장'은 같은 사람이다).
 predicate는 영어 대문자 스네이크. 가능하면 다음을 먼저 재사용: {seed_predicates}
 날짜/시점은 valid_from 속성으로만(엔티티로 만들지 마, 없으면 빈 문자열).
 순수 JSON만 출력: {{"relations":[{{"source":"...","target":"...","predicate":"...","valid_from":""}}]}}
@@ -166,6 +198,14 @@ predicate는 영어 대문자 스네이크. 가능하면 다음을 먼저 재사
 텍스트:
 {chunk}
 """
+
+
+# backend 미지정(None)은 '기본값 백엔드'로 해소한다. 라우터(llm_adapter.generate)는 None을 Gemini로
+# 보내므로, 이 해소가 없으면 추출 함수를 직접 호출할 때 문서가 조용히 외부 경로로 향한다 —
+# 이 프로젝트의 기본은 완전 로컬이고(규칙 1) settings.ingest_backend가 그 단일 출처다.
+# (키가 없는 머신에서는 클라이언트 생성 단계에서 즉시 실패해 전송은 없었지만, 키를 넣는 순간 살아나는 경로다.)
+def _resolve_backend(backend: str | None) -> str:
+    return backend or settings.ingest_backend
 
 
 # 숫자에 붙어 다니는 단위·조수사. 긴 것부터 지워야 "시간"이 "시"+"간"으로 쪼개지지 않는다.
@@ -271,6 +311,7 @@ def extract_chunk(
     model: str | None = None,
     backend: str | None = None,
 ) -> ExtractionResult | None:
+    backend = _resolve_backend(backend)
     try:
         raw_text = generate(
             _build_prompt(chunk, known_names or [], known_predicates or []),
@@ -299,6 +340,7 @@ def glean_chunk(
     model: str | None = None,
     backend: str | None = None,
 ) -> tuple[ExtractionResult, int]:
+    backend = _resolve_backend(backend)
     entities = {e.name: e for e in base.entities}  # 이름 기준 dedupe
     relations = {(r.source, r.predicate, r.target): r for r in base.relations}
     extra_calls = 0
@@ -375,14 +417,15 @@ def extract_entities_pass(
     known_names: list[str] | None = None,
     model: str | None = None,
     backend: str | None = None,
+    type_split: bool | None = None,
 ) -> list[ExtractedEntity] | None:
+    backend = _resolve_backend(backend)
     entities: list[ExtractedEntity] = []
     ok_groups = 0
-    groups = (
-        _ENTITY_TYPE_GROUPS
-        if settings.extraction_entity_type_split
-        else {"통합": _ENTITY_COMBINED_PROMPT}
-    )
+    # type_split이 None이면 하위호환: 기존 전역 토글(extraction_entity_type_split)을 그대로 읽는다.
+    # 명시되면(프로파일이 결정한 값) 그 값이 전역 토글보다 우선한다.
+    split = settings.extraction_entity_type_split if type_split is None else type_split
+    groups = _ENTITY_TYPE_GROUPS if split else {"통합": _ENTITY_COMBINED_PROMPT}
     for group_label, instruction in groups.items():
         prompt = _build_entity_pass_prompt(instruction, chunk, known_names or [])
         try:
@@ -430,6 +473,7 @@ def extract_relations_pass(
     model: str | None = None,
     backend: str | None = None,
 ) -> list[ExtractedRelation]:
+    backend = _resolve_backend(backend)
     if not entity_names:
         return []
     known_predicates_hint = ""
@@ -506,7 +550,11 @@ def _reconcile(entities: list[ExtractedEntity], relations: list[ExtractedRelatio
             continue
         winner_type = _resolve_type_conflict(entity.name, existing.type, entity.type)
         winner_desc = existing.description or entity.description
-        entity_map[entity.name] = ExtractedEntity(name=entity.name, type=winner_type, description=winner_desc)
+        # 별칭은 버리지 않고 합집합으로 합친다(옛 구현은 마지막 것으로 덮어써 앞서 뽑힌 호칭이 소실됐다).
+        winner_aliases = list(dict.fromkeys(existing.aliases + entity.aliases))
+        entity_map[entity.name] = ExtractedEntity(
+            name=entity.name, type=winner_type, description=winner_desc, aliases=winner_aliases
+        )
 
     relation_map: dict[tuple[str, str, str], ExtractedRelation] = {}
     for relation in relations:
@@ -514,10 +562,27 @@ def _reconcile(entities: list[ExtractedEntity], relations: list[ExtractedRelatio
         if key not in relation_map:
             relation_map[key] = relation
 
+    # 한 쌍(source,target)당 관계 1개로 축약한다(방향은 보존 — A→B와 B→A는 별개 쌍).
+    # 프롬프트가 "한 쌍 하나만" 지시해도 확률적이라 관측된 데카르트 곱 스팸(장인님-WORKS_FOR->장모님 +
+    # 장인님-PARENT_OF->... 동시 등장)을 코드로 최종 강제한다. 드물게 진짜 복수 관계(장인이 사위의
+    # 부모이자 고용주)를 버리는 트레이드오프를 감수한다 — 서사에선 드물고 스팸 피해가 압도적이다.
+    seen_pairs: set[tuple[str, str]] = set()
+    pair_deduped_relations: list[ExtractedRelation] = []
+    for relation in relation_map.values():
+        pair = (relation.source, relation.target)
+        if pair in seen_pairs:
+            logger.warning(
+                "관계 폐기(한 쌍 중복 — 한 쌍당 1개만 유지): %s -[%s]-> %s",
+                relation.source, relation.predicate, relation.target,
+            )
+            continue
+        seen_pairs.add(pair)
+        pair_deduped_relations.append(relation)
+
     kept_relations: list[ExtractedRelation] = []
     orphan_endpoints = 0
     total_endpoints = 0
-    for relation in relation_map.values():
+    for relation in pair_deduped_relations:
         endpoints = (relation.source, relation.target)
         total_endpoints += len(endpoints)
         if any(ep not in entity_map and _is_noise_name(ep) for ep in endpoints):
@@ -546,8 +611,10 @@ def extract_chunk_decomposed(
     known_predicates: list[str] | None = None,
     model: str | None = None,
     backend: str | None = None,
+    type_split: bool | None = None,
 ) -> ExtractionResult | None:
-    entities = extract_entities_pass(chunk, known_names, model=model, backend=backend)
+    backend = _resolve_backend(backend)
+    entities = extract_entities_pass(chunk, known_names, model=model, backend=backend, type_split=type_split)
     if entities is None:
         return None
     entity_names = [e.name for e in entities]
@@ -586,6 +653,26 @@ def store_extraction(collection: str, result: ExtractionResult, source_doc: str)
         # (summarize-descriptions)가 나중에 여러 문서의 설명을 하나로 통합할 때 재료로 쓴다.
         if entity.description:
             sqlite_manager.upsert_desc_candidate(collection, resolved_name, source_doc, entity.description)
+        # [coref] 엔티티 패스가 뽑은 동일인 별칭을 실제로 그래프에 등록한다 — 프롬프트 지시만으론
+        # 그래프에 안 남는다. 별칭이 이미 별개 노드로 존재하면(예: 앞선 청크가 "빙장"을 독립 인물로
+        # 잘못 만든 경우) merge_entity_into로 그 노드의 관계를 canonical로 흡수하고 노드를 지운다
+        # (5조각을 실제로 하나로). ingest 시점 노드 병합은 되돌리기 어려워 coref_ingest_merge로 끌 수
+        # 있게 둔다(False면 문자열 별칭만 등록하고 병합은 하지 않음).
+        # PERSON에만 적용한다 — coreference 프롬프트 지시도 사람 그룹에만 걸었고(§과제1.2 범위결정),
+        # 조직·사물 타입에 aliases가 실려 오면(모델 오작동/할루시네이션) 서로 다른 조직이 이름 우연으로
+        # 오병합되는 회귀(카카오≠카카오뱅크)를 코드로 원천 차단한다.
+        if entity.type != EntityType.PERSON and entity.aliases:
+            logger.warning("PERSON이 아닌 엔티티의 aliases 무시(오병합 방지): %s(%s)", entity.name, entity.type.value)
+        for alias in entity.aliases if entity.type == EntityType.PERSON else []:
+            if alias == resolved_name:
+                continue
+            if settings.coref_ingest_merge:
+                existing_canonical = graph_manager.find_canonical_name(collection, alias)
+                if existing_canonical is not None and existing_canonical != resolved_name:
+                    graph_manager.merge_entity_into(
+                        collection, keep_name=resolved_name, drop_name=existing_canonical
+                    )
+            graph_manager.add_alias(collection, resolved_name, alias)
     for relation in result.relations:
         graph_manager.upsert_relation(
             collection,
@@ -612,6 +699,62 @@ def _resolve_extraction_mode(mode: str, backend: str | None) -> str:
     return "decomposed" if backend in _DECOMPOSED_AUTO_BACKENDS else "single"
 
 
+# profile("quality"|"fast"|"auto")을 실제 type_split(bool)로 해소한다 — implementation_plan.md ②.
+# quality→True(5콜), fast→False(2콜), auto→ 청크수가 임계값 이하면 True(짧은 문서=quality),
+# 초과면 False(긴 문서=fast). 알 수 없는 값(오타 등)은 True로 안전 폴백(무손실 쪽이 기본).
+def _resolve_type_split(profile: str, chunk_count: int) -> bool:
+    if profile == "fast":
+        return False
+    if profile == "auto":
+        return chunk_count <= settings.extraction_fast_chunk_threshold
+    return True
+
+
+# 1인칭 단수 주어의 닫힌 소집합(KISS) — entity_resolution.strip_trailing_josa가 1~2자를 조사분리 대상에서
+# 보호하므로 이 표기들만 안정적으로 살아남는다. "나무"·"나리" 같은 부분일치는 정확 일치가 아니라 안 걸린다.
+_FIRST_PERSON_PRONOUNS = frozenset({"나", "내", "저"})
+
+
+# 파일명 접두사에 붙은 타임스탬프(예: 1787216682412_봄봄.md)를 벗겨 사람이 읽는 문서 라벨만 남긴다.
+# 1인칭 승격(document 범위)의 대표 이름에 타임스탬프가 그대로 노출되지 않게 하기 위함.
+def _doc_label_from_file_name(file_name: str) -> str:
+    return re.sub(r"^\d+_", "", Path(file_name).stem)
+
+
+# scope("document"|"collection")에 맞는 1인칭 대표 이름을 만든다. document는 문서마다 분리해
+# 다작 코퍼스(소설 여러 편)의 화자가 한 노드로 오병합되는 것을 막고, collection은 컬렉션 전체를
+# 한 화자로 합쳐 같은 글쓴이의 일기 같은 코퍼스에 맞춘다(코드가 코퍼스 성격을 알 수 없어 config로 남김).
+def _first_person_label(scope: str, doc_label: str) -> str:
+    return "화자" if scope == "collection" else f"화자({doc_label})"
+
+
+# "나"류 1인칭 단수 주어를 문서 단위(또는 컬렉션 단위) 대표 엔티티로 승격하는 순수 함수(LLM 없음).
+# scope="off"면 결과를 그대로 반환(포착만 하고 승격 안 함). process_file이 store_extraction 직전에 호출한다
+# (그 지점에만 사람이 읽는 file_name이 있다 — store_extraction은 source_id만 받는다).
+def _promote_first_person(
+    result: ExtractionResult, doc_label: str, scope: str | None = None
+) -> ExtractionResult:
+    scope = settings.first_person_scope if scope is None else scope
+    if scope == "off":
+        return result
+    label = _first_person_label(scope, doc_label)
+
+    def rename(name: str) -> str:
+        return label if name in _FIRST_PERSON_PRONOUNS else name
+
+    entities = [
+        ExtractedEntity(name=rename(e.name), type=e.type, description=e.description, aliases=e.aliases)
+        for e in result.entities
+    ]
+    relations = [
+        ExtractedRelation(
+            source=rename(r.source), target=rename(r.target), predicate=r.predicate, valid_from=r.valid_from
+        )
+        for r in result.relations
+    ]
+    return ExtractionResult(entities=entities, relations=relations)
+
+
 def process_file(
     file_path: Path,
     collection: str,
@@ -619,33 +762,66 @@ def process_file(
     glean_rounds: int | None = None,
     backend: str | None = None,
     extraction_mode: str | None = None,
+    profile: str | None = None,
 ) -> bool:
-    # backend=None/"gemini"이면 기존 Gemini 경로(RPD 한도 기록 포함). "ollama"/"claude_cli"는 로컬/구독이라
-    # Gemini 일일 한도(RPD)에 안 잡히므로 record_api_usage를 건너뛴다(아래 _is_gemini 참조).
-    _is_gemini = backend in (None, "gemini")
+    # 미지정은 기본 백엔드(settings.ingest_backend)로 먼저 해소한다 — 해소 전에 판단하면 로컬로 돌면서
+    # Gemini RPD를 깎는 오집계가 난다. 실제 Gemini일 때만 record_api_usage를 탄다(아래 _is_gemini).
+    backend = _resolve_backend(backend)
+    _is_gemini = backend == "gemini"
     mode = _resolve_extraction_mode(extraction_mode or settings.extraction_mode, backend)
     content = file_path.read_text(encoding="utf-8")
     file_name = file_path.name
     content_hash = document_store.compute_hash(content)
 
-    if not document_store.needs_processing(collection, file_name, content_hash):
-        logger.info("[%s] %s 은(는) 변경사항이 없어 건너뜁니다.", collection, file_name)
-        return False
+    # 재개 가능 인제스트(B) — 이전 시도의 진행 마커가 있고, 파일이 그때와 같으며, 아직 미완료면
+    # 같은 source_id를 재사용해 완료된 청크(done_chunks)부터 이어간다(implementation_plan.md ③).
+    progress = sqlite_manager.get_ingest_progress(collection, file_name)
+    resuming = bool(
+        progress
+        and progress["content_hash"] == content_hash
+        and progress["done_chunks"] < progress["total_chunks"]
+    )
+    if resuming:
+        source_id = progress["source_id"]
+        start_idx = progress["done_chunks"]
+    else:
+        if not document_store.needs_processing(collection, file_name, content_hash):
+            logger.info("[%s] %s 은(는) 변경사항이 없어 건너뜁니다.", collection, file_name)
+            return False
+        source_id = document_store.prepare_replacement(file_name)
+        start_idx = 0
 
-    source_id = document_store.prepare_replacement(file_name)
     # 변경 감지/원본 보존은 raw(content)로 끝냈으니, 청킹·임베딩·추출 입력만 표 노이즈를 걷어낸 정리본으로 쓴다.
     cleaned = document_store.clean_markdown(content)
     chunks = document_store.chunk_text(cleaned, settings.chunk_size, settings.chunk_overlap)
+
+    # chunk_size 등 설정이 중단 사이 바뀌어 청크 수가 어긋나면 재개를 폐기하고 처음부터 다시 돈다
+    # (같은 source_id는 재사용 — 그래프 쓰기가 멱등이라 안전, implementation_plan.md ③ 정합성 5).
+    if resuming and len(chunks) != progress["total_chunks"]:
+        resuming = False
+        start_idx = 0
+
+    if not resuming:
+        sqlite_manager.upsert_ingest_progress(collection, file_name, source_id, content_hash, len(chunks), 0)
+
     # gleaning 라운드 수 결정(인자 우선, 없으면 설정값).
     rounds = settings.glean_rounds if glean_rounds is None else glean_rounds
     # 청크마다 1차 LLM 호출 1번이 나가므로, 청크 수만큼 오늘 사용량에 기록한다(RPD 추적).
     # gleaning 추가 호출은 실제 소비한 만큼 아래에서 따로 더한다.
     if _is_gemini:
         sqlite_manager.record_api_usage(len(chunks))
-    vector_manager.add_chunks(source_id, chunks, collection)
+    vector_manager.add_chunks(source_id, chunks, collection)  # upsert(멱등) — 재개 시 재add해도 중복 없음
+
+    # A: 프로파일이 type_split을 결정한다 — decomposed 모드에서만 의미 있다(single/gemini는 개념이 없어 무시).
+    resolved_profile = profile or settings.extraction_profile
+    type_split = _resolve_type_split(resolved_profile, len(chunks)) if mode == "decomposed" else None
+    # 1인칭 승격 라벨은 파일명에서 한 번만 뽑는다(청크마다 동일 — file_name은 루프 내내 안 바뀜).
+    doc_label = _doc_label_from_file_name(file_name)
 
     extra_calls = 0
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        if i < start_idx:
+            continue  # 재개: 이미 완료된 청크는 재추출하지 않는다.
         # 청크마다 매번 새로 가져온다 — 같은 문서를 처리하는 중에도 앞 청크가 막 만든
         # 엔티티/관계 이름을 뒤 청크가 못 보면, 한 문서 안에서도 표현이 갈라진다(91청크 실제 검증으로 확인됨).
         # 어휘 힌트는 '이 컬렉션' 범위로만 모은다 — 다른 사업의 이름이 섞여 들어가지 않게.
@@ -654,7 +830,9 @@ def process_file(
 
         if mode == "decomposed":
             # 분해 모드는 패스 분리 자체가 gleaning의 역할(놓친 것 캐기)을 이미 하므로 gleaning은 스킵한다(계획 ④).
-            result = extract_chunk_decomposed(chunk, known_names, known_predicates, model=model, backend=backend)
+            result = extract_chunk_decomposed(
+                chunk, known_names, known_predicates, model=model, backend=backend, type_split=type_split
+            )
         else:
             result = extract_chunk(chunk, known_names, known_predicates, model=model, backend=backend)
             # gleaning: 놓친 엔티티/관계를 몇 번 더 캐내 누적한다(옵트인, rounds>0일 때만).
@@ -663,14 +841,19 @@ def process_file(
                 extra_calls += calls
         if result is None:
             continue
+        result = _promote_first_person(result, doc_label)
         try:
             store_extraction(collection, result, source_id)
+            # 저장 성공 직후에만 durable 마커 증가. store가 예외로 실패하면 마커를 안 올려, 재개 시 그 청크를
+            # 다시 처리한다(멱등이라 안전). except 밖에 두면 실패 청크가 완료로 스킵돼 데이터가 유실된다.
+            sqlite_manager.set_ingest_progress_done(collection, file_name, i + 1)
         except Exception as exc:
             logger.error("그래프 저장 실패, 이 청크 결과는 건너뜀: %s", exc)
 
     if extra_calls and _is_gemini:
         sqlite_manager.record_api_usage(extra_calls)  # gleaning으로 추가 소비한 호출 기록(Gemini만)
     document_store.commit_document(source_id, collection, file_name, content, content_hash)
+    sqlite_manager.delete_ingest_progress(collection, file_name)  # 커밋 성공 후에만 진행 마커 제거
     # [M2] 그래프가 바뀌었으니 이 컬렉션의 커뮤니티는 재빌드가 필요하다(LLM 없이 플래그만 세팅 — 값싼 인제스트 경로 불변).
     sqlite_manager.mark_communities_dirty(collection)
     logger.info("[%s] %s 처리 완료 (source_id=%s, 청크 %d개)", collection, file_name, source_id, len(chunks))

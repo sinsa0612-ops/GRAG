@@ -406,7 +406,8 @@ def test_process_file_gleaning_adds_missed_entities(tmp_path, monkeypatch):
     file_path = tmp_path / "memo.md"
     file_path.write_text("에이는 사람이다.", encoding="utf-8")
 
-    assert ingest.process_file(file_path, C, glean_rounds=1) is True
+    # gleaning은 단일패스 전용이다(분해 추출은 건너뛴다) — 그 경로를 타도록 백엔드를 명시한다.
+    assert ingest.process_file(file_path, C, glean_rounds=1, backend="gemini") is True
     names = {e["name"] for e in graph_manager.get_all_entities()}
     assert {"에이", "비이"} <= names
 
@@ -430,8 +431,10 @@ def test_process_file_ollama_backend_skips_rpd_usage(tmp_path, monkeypatch):
     assert calls["n"] == 0  # 로컬/구독 백엔드는 RPD를 소비하지 않음
 
 
-def test_process_file_default_backend_records_rpd_usage(tmp_path, monkeypatch):
-    # 대조군: 기본(Gemini) 백엔드는 기존대로 청크 수만큼 RPD를 기록해야 한다(스킵이 무조건이 아님을 고정).
+def test_process_file_default_backend_follows_settings_not_gemini(tmp_path, monkeypatch):
+    # backend 미지정은 settings.ingest_backend(기본 ollama)로 해소된다 — 규칙 1(로컬이 기본값).
+    # 라우터는 None을 Gemini로 보내므로, 이 해소가 없으면 미지정 호출이 조용히 외부로 향한다.
+    # RPD 기록도 '실제로 Gemini일 때만' 일어나야 한다(로컬로 돌면서 한도를 깎으면 오집계).
     monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
     monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
     calls = {"n": 0}
@@ -442,8 +445,15 @@ def test_process_file_default_backend_records_rpd_usage(tmp_path, monkeypatch):
     file_path = tmp_path / "memo.md"
     file_path.write_text("강택리는 기획자다.", encoding="utf-8")
 
-    assert ingest.process_file(file_path, C) is True  # backend 미지정 = Gemini
-    assert calls["n"] >= 1  # 기존 RPD 기록 경로 불변
+    monkeypatch.setattr(settings, "ingest_backend", "ollama")
+    assert ingest.process_file(file_path, C) is True
+    assert calls["n"] == 0  # 로컬 기본값 → RPD 기록 없음
+
+    # 설정을 gemini로 두면 그때는 기존대로 기록한다(스킵이 무조건이 아님을 고정).
+    file_path.write_text("강택리는 기획자이고 배우다.", encoding="utf-8")
+    monkeypatch.setattr(settings, "ingest_backend", "gemini")
+    assert ingest.process_file(file_path, C) is True
+    assert calls["n"] >= 1
 
 
 def test_process_file_forwards_backend_to_generate(tmp_path, monkeypatch):
@@ -593,6 +603,236 @@ def test_reconcile_returns_valid_extraction_result_type():
     assert isinstance(result, ExtractionResult)
     assert result.entities == []
     assert result.relations == []
+
+
+# --- 서사·구어체 추출 품질(implementation_plan.md): coreference(과제1) + 관계 절제(과제2) ---
+
+
+def test_reconcile_unions_aliases_on_dedup():
+    # 같은 name이 두 번(각각 다른 별칭으로) 들어오면, 옛 구현(마지막 것으로 덮어씀)과 달리 합집합으로 합쳐야 한다.
+    from schemas import ExtractedEntity
+
+    entities = [
+        ExtractedEntity(name="장인", type="PERSON", description="", aliases=["빙장"]),
+        ExtractedEntity(name="장인", type="PERSON", description="", aliases=["봉필씨"]),
+    ]
+    result = ingest._reconcile(entities, [])
+
+    assert len(result.entities) == 1
+    assert set(result.entities[0].aliases) == {"빙장", "봉필씨"}
+
+
+def test_reconcile_keeps_one_relation_per_pair(caplog):
+    # 관측된 스팸(장인님-WORKS_FOR->장모님 + 장인님-PARENT_OF->장모님 동시 등장)을 코드로 최종 강제한다.
+    from schemas import ExtractedEntity, ExtractedRelation
+
+    entities = [ExtractedEntity(name="A", type="PERSON"), ExtractedEntity(name="B", type="PERSON")]
+    relations = [
+        ExtractedRelation(source="A", target="B", predicate="WORKS_FOR"),
+        ExtractedRelation(source="A", target="B", predicate="PARENT_OF"),
+        ExtractedRelation(source="A", target="B", predicate="FRIEND_OF"),
+    ]
+    with caplog.at_level("WARNING"):
+        result = ingest._reconcile(entities, relations)
+
+    assert len(result.relations) == 1
+    assert result.relations[0].predicate == "WORKS_FOR"  # 먼저 온 것 유지
+    assert any("한 쌍 중복" in r.message for r in caplog.records)
+
+
+def test_reconcile_preserves_direction_as_distinct():
+    # 방향 보존: A→B와 B→A는 무순 병합 대상이 아니라 별개 쌍으로 둘 다 남아야 한다(상호관계 표현).
+    from schemas import ExtractedEntity, ExtractedRelation
+
+    entities = [ExtractedEntity(name="A", type="PERSON"), ExtractedEntity(name="B", type="PERSON")]
+    relations = [
+        ExtractedRelation(source="A", target="B", predicate="BETROTHED_TO"),
+        ExtractedRelation(source="B", target="A", predicate="BETROTHED_TO"),
+    ]
+    result = ingest._reconcile(entities, relations)
+
+    pairs = {(r.source, r.target) for r in result.relations}
+    assert pairs == {("A", "B"), ("B", "A")}
+
+
+def test_store_extraction_registers_string_alias():
+    # alias가 아직 미존재 이름이면 add_alias만 등록되고 새 노드는 생기지 않는다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[ExtractedEntity(name="장인", type="PERSON", description="", aliases=["빙장", "봉필씨"])],
+        relations=[],
+    )
+    ingest.store_extraction(C, result, "doc1")
+
+    names = {e["name"] for e in graph_manager.get_all_entities()}
+    assert names == {"장인"}  # 별칭 이름으로 새 노드가 생기지 않음
+    entity = graph_manager.get_entity(C, "장인")
+    assert set(entity["aliases"]) == {"빙장", "봉필씨"}
+
+
+def test_store_extraction_merges_preexisting_alias_node():
+    # "지시만 하고 등록 안 됨" 결함을 잡는 핵심 테스트: 별칭 이름이 이미 별개 노드(관계 보유)로 있으면
+    # merge_entity_into로 실제 흡수돼 최종 노드 1개 + 그 노드가 양쪽 관계를 모두 가져야 한다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractedRelation, ExtractionResult
+
+    # 앞선 청크가 "빙장"을 독립 인물로(관계까지) 잘못 만들어둔 상태를 재현.
+    prior = ExtractionResult(
+        entities=[
+            ExtractedEntity(name="빙장", type="PERSON", description="장인"),
+            ExtractedEntity(name="점순이", type="PERSON", description="아내"),
+        ],
+        relations=[ExtractedRelation(source="빙장", target="점순이", predicate="PARENT_OF")],
+    )
+    ingest.store_extraction(C, prior, "doc1")
+
+    # 이후 청크가 "장인"을 대표로, "빙장"을 별칭으로 정확히 묶어서 뽑음.
+    later = ExtractionResult(
+        entities=[ExtractedEntity(name="장인", type="PERSON", description="", aliases=["빙장"])],
+        relations=[],
+    )
+    ingest.store_extraction(C, later, "doc2")
+
+    names = {e["name"] for e in graph_manager.get_all_entities()}
+    assert names == {"장인", "점순이"}  # "빙장" 노드는 사라지고 흡수됨
+    entity = graph_manager.get_entity(C, "장인")
+    assert "빙장" in entity["aliases"]
+    # 흡수 전 "빙장"이 가졌던 관계가 "장인"에게 그대로 옮겨져야 한다.
+    outgoing = graph_manager.get_outgoing_relations(C, "장인")
+    assert any(r["predicate"] == "PARENT_OF" and r["target"] == "점순이" for r in outgoing)
+
+
+def test_store_extraction_coref_ingest_merge_off_registers_alias_only(monkeypatch):
+    # 안전판: coref_ingest_merge=False면 이미 있는 별개 노드라도 병합하지 않고 문자열 별칭만 등록한다.
+    monkeypatch.setattr(settings, "coref_ingest_merge", False)
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractionResult
+
+    prior = ExtractionResult(entities=[ExtractedEntity(name="빙장", type="PERSON")], relations=[])
+    ingest.store_extraction(C, prior, "doc1")
+
+    later = ExtractionResult(
+        entities=[ExtractedEntity(name="장인", type="PERSON", aliases=["빙장"])], relations=[]
+    )
+    ingest.store_extraction(C, later, "doc2")
+
+    names = {e["name"] for e in graph_manager.get_all_entities()}
+    assert names == {"장인", "빙장"}  # 병합 안 됨 — 두 노드 모두 존속
+
+
+def test_store_extraction_regression_guard_kakao_bank_not_merged():
+    # 회귀 가드(리트머스): 카카오뱅크가 이미 별개 관계 보유 노드로 존재하는 상태에서, "카카오"가
+    # (모델 오작동으로) aliases에 "카카오뱅크"를 실어 보내도 ORGANIZATION은 coref 병합 대상이 아니므로
+    # (사람 그룹에만 건 지시 — §과제1.2) 서로 다른 조직이 하나로 흡수되면 안 된다.
+    graph_manager.init_schema()
+    sqlite_manager.init_schema()
+    from schemas import ExtractedEntity, ExtractedRelation, ExtractionResult
+
+    prior = ExtractionResult(
+        entities=[
+            ExtractedEntity(name="카카오뱅크", type="ORGANIZATION", description="인터넷전문은행"),
+            ExtractedEntity(name="이용우", type="PERSON", description="카카오뱅크 대표"),
+        ],
+        relations=[ExtractedRelation(source="이용우", target="카카오뱅크", predicate="WORKS_AT")],
+    )
+    ingest.store_extraction(C, prior, "doc1")
+
+    later = ExtractionResult(
+        entities=[
+            ExtractedEntity(name="카카오", type="ORGANIZATION", description="플랫폼 기업", aliases=["카카오뱅크"])
+        ],
+        relations=[],
+    )
+    ingest.store_extraction(C, later, "doc2")
+
+    names = {e["name"] for e in graph_manager.get_all_entities()}
+    assert {"카카오", "카카오뱅크", "이용우"} <= names  # 셋 다 별개로 존속(흡수 안 됨)
+    outgoing = graph_manager.get_outgoing_relations(C, "이용우")
+    assert any(r["predicate"] == "WORKS_AT" and r["target"] == "카카오뱅크" for r in outgoing)
+
+
+# --- 1인칭 화자 "나" 승격(과제3) ---
+
+
+def test_doc_label_from_file_name_strips_timestamp_prefix():
+    assert ingest._doc_label_from_file_name("1787216682412_봄봄.md") == "봄봄"
+    assert ingest._doc_label_from_file_name("memo.md") == "memo"  # 접두사 없으면 그대로
+
+
+def test_promote_first_person_document_scope_labels_by_doc():
+    from schemas import ExtractedEntity, ExtractedRelation, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[ExtractedEntity(name="나", type="PERSON", description="주인공")],
+        relations=[ExtractedRelation(source="나", target="점순이", predicate="BETROTHED_TO")],
+    )
+    promoted_a = ingest._promote_first_person(result, doc_label="봄봄", scope="document")
+    promoted_b = ingest._promote_first_person(result, doc_label="동백꽃", scope="document")
+
+    assert promoted_a.entities[0].name == "화자(봄봄)"
+    assert promoted_a.relations[0].source == "화자(봄봄)"
+    assert promoted_b.entities[0].name == "화자(동백꽃)"
+    assert promoted_a.entities[0].name != promoted_b.entities[0].name  # 문서별로 분리
+
+
+def test_promote_first_person_collection_scope_uses_stable_name():
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(entities=[ExtractedEntity(name="저", type="PERSON")], relations=[])
+    promoted_a = ingest._promote_first_person(result, doc_label="1일차", scope="collection")
+    promoted_b = ingest._promote_first_person(result, doc_label="2일차", scope="collection")
+
+    assert promoted_a.entities[0].name == "화자"
+    assert promoted_b.entities[0].name == "화자"  # 라벨 없이 단일 대표로 합쳐짐
+
+
+def test_promote_first_person_off_is_noop():
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(entities=[ExtractedEntity(name="나", type="PERSON")], relations=[])
+    promoted = ingest._promote_first_person(result, doc_label="봄봄", scope="off")
+
+    assert promoted.entities[0].name == "나"  # 승격 안 함(포착만)
+
+
+def test_promote_first_person_leaves_non_pronoun_untouched():
+    from schemas import ExtractedEntity, ExtractionResult
+
+    result = ExtractionResult(
+        entities=[
+            ExtractedEntity(name="나무", type="OBJECT"),
+            ExtractedEntity(name="나리", type="PERSON"),
+        ],
+        relations=[],
+    )
+    promoted = ingest._promote_first_person(result, doc_label="봄봄", scope="document")
+
+    assert {e.name for e in promoted.entities} == {"나무", "나리"}  # 부분일치는 안 건드림
+
+
+def test_process_file_promotes_first_person_before_store(tmp_path, monkeypatch):
+    # 통합 배선 확인: process_file이 store_extraction 직전에 승격을 적용해야 그래프에 화자(라벨)로 남는다.
+    response = json.dumps(
+        {"entities": [{"name": "나", "type": "PERSON", "description": "주인공"}], "relations": []}
+    )
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: response)
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "1787216682412_봄봄.md"
+    file_path.write_text("나는 주인공이다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, backend="gemini", extraction_mode="single") is True
+
+    names = {e["name"] for e in graph_manager.get_all_entities()}
+    assert "화자(봄봄)" in names
+    assert "나" not in names
 
 
 def test_extract_entities_pass_calls_all_type_groups_and_filters_noise(monkeypatch):
@@ -825,3 +1065,266 @@ def test_entity_type_split_off_uses_single_combined_call(monkeypatch):
     assert {e.name for e in entities} == {"정신아", "판교"}
     # 통합 프롬프트도 같은 온톨로지로 답하도록 타입 목록을 담고 있어야 한다.
     assert "PERSON|ORGANIZATION|LOCATION" in calls[0]
+
+
+# --- A: 추출 프로파일(quality/fast/auto) — implementation_plan.md ②, CEO 결정: 기본 quality ---
+
+
+def test_resolve_type_split_quality_and_fast_are_fixed_regardless_of_chunk_count():
+    assert ingest._resolve_type_split("quality", 1) is True
+    assert ingest._resolve_type_split("quality", 999) is True
+    assert ingest._resolve_type_split("fast", 1) is False
+    assert ingest._resolve_type_split("fast", 999) is False
+
+
+def test_resolve_type_split_auto_uses_chunk_threshold(monkeypatch):
+    monkeypatch.setattr(settings, "extraction_fast_chunk_threshold", 3)
+    assert ingest._resolve_type_split("auto", 3) is True  # 임계 이하 = quality
+    assert ingest._resolve_type_split("auto", 4) is False  # 임계 초과 = fast
+
+
+def test_resolve_type_split_unknown_profile_falls_back_to_quality():
+    assert ingest._resolve_type_split("오타난값", 100) is True
+
+
+def test_extract_entities_pass_explicit_type_split_overrides_global_toggle(monkeypatch):
+    # 명시된 type_split이 전역 토글보다 우선해야 한다(profile이 결정한 값이 이김).
+    monkeypatch.setattr(settings, "extraction_entity_type_split", False)
+    calls = []
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: calls.append(prompt) or json.dumps({"entities": []})
+    )
+
+    ingest.extract_entities_pass("텍스트", type_split=True)
+    assert len(calls) == 4  # 전역 토글(False)과 무관하게 4콜
+
+    calls.clear()
+    monkeypatch.setattr(settings, "extraction_entity_type_split", True)
+    ingest.extract_entities_pass("텍스트", type_split=False)
+    assert len(calls) == 1  # 전역 토글(True)과 무관하게 1콜
+
+
+def test_extract_entities_pass_type_split_none_follows_global_toggle_for_backward_compat(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: calls.append(prompt) or json.dumps({"entities": []})
+    )
+    monkeypatch.setattr(settings, "extraction_entity_type_split", True)
+
+    ingest.extract_entities_pass("텍스트")  # type_split 미지정(None)
+
+    assert len(calls) == 4  # 하위호환: 기존 전역 토글값을 그대로 따름
+
+
+def _fake_generate_always_returns_one_entity(prompt: str, calls: dict) -> str:
+    # 엔티티 패스든(타입군 4개든 통합 1개든) 관계 패스든 호출 수만 세면 되므로, 관계 패스가 물을 대상이
+    # 있도록 엔티티 패스 호출에는 항상 엔티티 1개를 돌려준다(관계 패스는 엔티티가 없으면 호출 자체를 생략함).
+    calls["n"] += 1
+    if "[엔티티 목록]" in prompt:
+        return json.dumps({"relations": []})
+    return json.dumps({"entities": [{"name": "강택리", "type": "PERSON", "description": ""}]})
+
+
+def test_process_file_profile_quality_makes_five_calls_per_chunk(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: _fake_generate_always_returns_one_entity(prompt, calls)
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, backend="ollama", profile="quality") is True
+    assert calls["n"] == 5  # 엔티티 4(타입군) + 관계 1
+
+
+def test_process_file_profile_fast_makes_two_calls_per_chunk(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: _fake_generate_always_returns_one_entity(prompt, calls)
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, backend="ollama", profile="fast") is True
+    assert calls["n"] == 2  # 엔티티 통합 1 + 관계 1
+
+
+def test_process_file_profile_auto_routes_long_document_to_fast(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "chunk_size", 10)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+    monkeypatch.setattr(settings, "extraction_fast_chunk_threshold", 1)
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: _fake_generate_always_returns_one_entity(prompt, calls)
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "long.md"
+    text = "강택리는 기획자다. 강택리는 ISA계좌를 운영한다."
+    file_path.write_text(text, encoding="utf-8")
+    expected_chunks = len(document_store.chunk_text(document_store.clean_markdown(text), 10, 0))
+    assert expected_chunks > 1  # 임계값(1) 초과를 보장 → auto가 fast로 보내야 함
+
+    assert ingest.process_file(file_path, C, backend="ollama", profile="auto") is True
+    assert calls["n"] == expected_chunks * 2  # fast: 청크당 2콜
+
+
+def test_process_file_profile_auto_routes_short_document_to_quality(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "extraction_fast_chunk_threshold", 3)
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: _fake_generate_always_returns_one_entity(prompt, calls)
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "short.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")  # 1청크 <= 임계 3
+
+    assert ingest.process_file(file_path, C, backend="ollama", profile="auto") is True
+    assert calls["n"] == 5  # quality: 청크당 5콜
+
+
+def test_process_file_profile_unspecified_matches_current_default_five_calls(tmp_path, monkeypatch):
+    # 회귀 가드: --profile 미지정 + config 기본 quality = 현행 5콜 동작과 동일해야 한다.
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        ingest, "generate", lambda prompt, **kwargs: _fake_generate_always_returns_one_entity(prompt, calls)
+    )
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 기획자다.", encoding="utf-8")
+
+    assert ingest.process_file(file_path, C, backend="ollama") is True  # profile 인자 자체를 생략
+    assert calls["n"] == 5
+
+
+# --- B: 재개 가능 인제스트 — implementation_plan.md ③ (크래시 후 완료 청크 스킵) ---
+
+
+def test_resume_after_crash_skips_completed_chunks_and_reprocesses_remainder(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "chunk_size", 10)
+    monkeypatch.setattr(settings, "chunk_overlap", 0)
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+
+    file_path = tmp_path / "memo.md"
+    text = "가나다라마바사아자차카. 파하거너더러머버서어저처커터퍼허. 고노도로모보소오조초코토포호."
+    file_path.write_text(text, encoding="utf-8")
+    total_chunks = len(document_store.chunk_text(document_store.clean_markdown(text), 10, 0))
+    assert total_chunks >= 4  # 크래시 지점을 중간에 둘 수 있도록
+
+    # get_known_entity_names는 청크 루프에서 try/except 없이(진짜 크래시처럼) 호출되는 지점이다 —
+    # store_extraction 실패는 기존부터 의도적으로 흡수되므로(청크 단위 회복력) 진짜 크래시 재현엔 부적합하다.
+    real_get_known_names = graph_manager.get_known_entity_names
+    call_count = {"n": 0}
+    crash_at_call = 3  # 3번째 청크(i=2) 처리 시작 시점에 크래시 → 청크 0,1(2개)만 완료돼야 함
+
+    def flaky_get_known_names(collections):
+        call_count["n"] += 1
+        if call_count["n"] == crash_at_call:
+            raise RuntimeError("프로세스 크래시 주입")
+        return real_get_known_names(collections)
+
+    monkeypatch.setattr(graph_manager, "get_known_entity_names", flaky_get_known_names)
+
+    with pytest.raises(RuntimeError):
+        ingest.process_file(file_path, C, backend="gemini", extraction_mode="single")
+
+    progress = sqlite_manager.get_ingest_progress(C, "memo.md")
+    assert progress is not None
+    assert progress["done_chunks"] == crash_at_call - 1  # 청크 0,1까지만 완료 마커
+
+    content_hash = document_store.compute_hash(text)
+    assert document_store.needs_processing(C, "memo.md", content_hash) is True  # 미커밋
+
+    # 재실행: 크래시 지점을 정상 동작으로 복구하고, 실제로 재추출되는 청크를 스파이로 기록한다.
+    monkeypatch.setattr(graph_manager, "get_known_entity_names", real_get_known_names)
+    processed_chunks = []
+    original_extract_chunk = ingest.extract_chunk
+
+    def spy_extract_chunk(chunk, *a, **k):
+        processed_chunks.append(chunk)
+        return original_extract_chunk(chunk, *a, **k)
+
+    monkeypatch.setattr(ingest, "extract_chunk", spy_extract_chunk)
+
+    assert ingest.process_file(file_path, C, backend="gemini", extraction_mode="single") is True
+
+    all_chunks = document_store.chunk_text(document_store.clean_markdown(text), 10, 0)
+    # 완료됐던 청크 0,1은 재추출되지 않고, 인덱스 2부터만 재실행됐어야 한다.
+    assert processed_chunks == all_chunks[crash_at_call - 1 :]
+
+    # 완료 후 진행 마커는 삭제되고 문서는 커밋된다.
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") is None
+    assert document_store.needs_processing(C, "memo.md", content_hash) is False
+
+
+def test_resume_ignored_when_file_content_changed_since_crash(tmp_path, monkeypatch):
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+
+    # 이전(크래시 난) 시도가 남긴 진행 마커를 옛 내용의 해시로 직접 세팅해둔다.
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_old", "옛-해시", total_chunks=5, done_chunks=2)
+
+    file_path = tmp_path / "memo.md"
+    file_path.write_text("강택리는 완전히 새로운 내용이다.", encoding="utf-8")  # 새 해시 → 재개 불가
+
+    assert ingest.process_file(file_path, C, backend="gemini", extraction_mode="single") is True
+
+    new_source_id = sqlite_manager.get_document_source_id(C, "memo.md")
+    assert new_source_id != "doc_old"  # 옛 source_id를 재사용하지 않고 새로 시작
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") is None  # 완료 후 정리됨
+
+
+def test_resume_discarded_when_chunk_count_changed_since_crash(tmp_path, monkeypatch):
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr("db.vector_manager.add_chunks", lambda *a, **k: None)
+    monkeypatch.setattr(ingest, "generate", lambda prompt, **kwargs: VALID_RESPONSE)
+
+    file_path = tmp_path / "memo.md"
+    text = "강택리는 기획자다."
+    file_path.write_text(text, encoding="utf-8")
+    content_hash = document_store.compute_hash(text)
+    real_chunk_count = len(
+        document_store.chunk_text(document_store.clean_markdown(text), settings.chunk_size, settings.chunk_overlap)
+    )
+
+    # chunk_size가 그 사이 바뀐 것처럼, 실제 청크 수와 다른 total_chunks로 진행 마커를 남겨둔다.
+    sqlite_manager.upsert_ingest_progress(
+        C, "memo.md", "doc_stale", content_hash, total_chunks=real_chunk_count + 5, done_chunks=1
+    )
+
+    extract_calls = []
+    original_extract_chunk = ingest.extract_chunk
+
+    def spy_extract_chunk(chunk, *a, **k):
+        extract_calls.append(chunk)
+        return original_extract_chunk(chunk, *a, **k)
+
+    monkeypatch.setattr(ingest, "extract_chunk", spy_extract_chunk)
+
+    assert ingest.process_file(file_path, C, backend="gemini", extraction_mode="single") is True
+
+    assert len(extract_calls) == real_chunk_count  # 재개 폐기 → 모든 청크가 스킵 없이 다시 추출됨
+    assert sqlite_manager.get_document_source_id(C, "memo.md") == "doc_stale"  # source_id는 재사용(멱등이라 안전)
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") is None

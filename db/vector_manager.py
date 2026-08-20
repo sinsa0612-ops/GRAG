@@ -39,6 +39,9 @@ def init_schema() -> None:
 
 
 # 문서 청크들을 임베딩하여 컬렉션에 저장한다. 각 청크에 소속 컬렉션(사업) 태그를 함께 단다.
+# upsert(add 아님)를 쓴다 — 재개 가능 인제스트(B)가 중단된 문서를 재실행하면 같은 source_id를 재사용해
+# 청크 id(`{source_id}_chunk_{i}`)가 이미 존재할 수 있는데, add는 중복 id에서 에러를 낸다. 신규 문서는
+# source_id가 uuid라 id가 항상 유일하므로 upsert도 add와 동일하게 동작한다(회귀 0).
 def add_chunks(source_id: str, chunks: list[str], collection_name: str) -> None:
     if not chunks:
         return
@@ -46,7 +49,7 @@ def add_chunks(source_id: str, chunks: list[str], collection_name: str) -> None:
     vectors = embed_texts(chunks)
     ids = [f"{source_id}_chunk_{i}" for i in range(len(chunks))]
     metadatas = [{"source_id": source_id, "collection": collection_name} for _ in chunks]
-    collection.add(ids=ids, embeddings=vectors, documents=chunks, metadatas=metadatas)
+    collection.upsert(ids=ids, embeddings=vectors, documents=chunks, metadatas=metadatas)
 
 
 # 특정 문서의 청크를 모두 삭제한다 (증분 업데이트 시 재처리 전 호출).

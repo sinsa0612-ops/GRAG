@@ -163,10 +163,12 @@ def cmd_ingest(args) -> None:
         _run_auto_merge(collection, args)
         return
     extraction_mode = getattr(args, "extraction_mode", None)
+    profile = getattr(args, "profile", None)
     for path, _ in estimates:
         try:
             changed = ingest.process_file(
-                path, collection, glean_rounds=glean, backend=backend, extraction_mode=extraction_mode
+                path, collection, glean_rounds=glean, backend=backend,
+                extraction_mode=extraction_mode, profile=profile,
             )
         except Exception as exc:
             failed_dir = settings.failed_dir / collection
@@ -586,6 +588,11 @@ def main(argv: list[str] | None = None) -> None:
     p_ingest.add_argument(
         "--extraction-mode", choices=["auto", "single", "decomposed"], default=None,
         help="추출 방식(기본: 설정값 auto). auto=로컬/구독 백엔드는 decomposed, gemini는 single.",
+    )
+    p_ingest.add_argument(
+        "--profile", choices=["quality", "fast", "auto"], default=None,
+        help="추출 프로파일(기본: 설정값 quality, decomposed 모드에서만 유효). "
+        "quality=청크당 5콜(정밀), fast=2콜(속도), auto=문서 길이로 자동 선택.",
     )
     p_ingest.set_defaults(func=cmd_ingest)
 

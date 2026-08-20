@@ -2,7 +2,7 @@
 import re
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 
 # 엔티티 type을 고정된 온톨로지로 가둔다 — 같은 뜻의 타입이 파편화(Person/사람/인물)되는 것을 막는다.
@@ -24,6 +24,10 @@ class ExtractedEntity(BaseModel):
     name: str = Field(min_length=1)
     type: EntityType = EntityType.OTHER
     description: str = ""
+    # 같은 대상의 다른 호칭(장인/빙장/봉필씨). 대표 이름은 name 하나만 쓰고 나머지는 여기로 몬다
+    # (coreference — implementation_plan.md 과제1). default_factory라 기존 호출부(고아 끝점 생성 등)는
+    # 아무 변경 없이 그대로 동작한다.
+    aliases: list[str] = Field(default_factory=list)
 
     @field_validator("type", mode="before")
     @classmethod
@@ -34,6 +38,26 @@ class ExtractedEntity(BaseModel):
         if isinstance(value, str) and value.strip().upper() in EntityType.__members__:
             return value.strip().upper()
         return EntityType.OTHER
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    # LLM이 내놓은 별칭 목록을 방어적으로 정리한다: 빈/비문자열 원소 제거, 자기 자신(name과 동일) 제외,
+    # 순서를 보존한 중복 제거. name과 비교해야 해서 필드 순서를 이용해 info.data로 이미 검증된 name을 읽는다.
+    def _clean_aliases(cls, value: object, info: ValidationInfo) -> object:
+        if not isinstance(value, list):
+            return value
+        own_name = info.data.get("name")
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            alias = item.strip()
+            if not alias or alias == own_name or alias in seen:
+                continue
+            seen.add(alias)
+            cleaned.append(alias)
+        return cleaned
 
 
 # LLM이 추출한 엔티티 간 관계 하나를 표현한다.

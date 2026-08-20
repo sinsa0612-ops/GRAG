@@ -144,6 +144,23 @@ class Settings(BaseSettings):
     # 속도가 더 급하고 recall을 조금 내줘도 되는 배치에서만 False로 낮춘다(콜 수 60% 감소).
     extraction_entity_type_split: bool = True
 
+    # --- 추출 프로파일(길이 기반 자동 선택) 설정 — implementation_plan.md ② ---
+    # quality=type_split True(5콜), fast=False(2콜), auto=문서 청크수로 결정. 기본은 quality
+    # (현행 무손실 출하, CEO 결정 2026-08-20) — fast/auto는 옵트인. 측정(⑥ fast vs quality 소설 실측)
+    # 후 auto 승격 검토. decomposed 모드에서만 유효(single/gemini는 무시).
+    extraction_profile: str = "quality"
+    # auto 프로파일에서 이 청크수를 초과하는 문서는 fast로, 이하는 quality로 내려간다. 임시값 — 측정으로 확정.
+    extraction_fast_chunk_threshold: int = 3
+
+    # --- 서사·구어체 추출 품질(coreference/1인칭) 설정 — implementation_plan.md(서사 품질) ---
+    # ingest 시점에 별칭이 이미 별개 노드로 존재하면 merge_entity_into로 실제 흡수할지 여부.
+    # True(기본)면 within-chunk·temp=0의 고정밀 coref를 그대로 그래프에 반영한다(A/B 실측 근거).
+    # 되돌리기 어려운 노드 병합이라 오병합이 관측되면 False로 낮춰 문자열 별칭 등록만 하게 강등할 수 있다.
+    coref_ingest_merge: bool = True
+    # 1인칭 "나"를 문서 단위 대표 엔티티로 승격할 범위. document(기본)=파일별로 분리(다작 소설 오병합 방지),
+    # collection=컬렉션 전체를 한 화자로 합침(같은 글쓴이 일기에 적합, CEO가 옵트인), off=승격 안 함(포착만).
+    first_person_scope: str = "document"
+
     # --- 인제스트(추출) 기본 백엔드 ---
     # 외부 업로드 금지(완전 로컬)가 기본이라 ollama. 데이터를 Gemini로 보내도 되면 .env에서 INGEST_BACKEND=gemini로
     # 바꾸거나 `graphrag ingest --backend gemini`로 건별 옵트인(그때만 RPD 한도 적용). 이렇게 두면 아무 플래그 없이

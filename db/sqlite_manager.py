@@ -186,6 +186,21 @@ def init_schema() -> None:
         report_cols = {row[1] for row in conn.execute("PRAGMA table_info(community_reports)").fetchall()}
         if "content_signature" not in report_cols:
             conn.execute("ALTER TABLE community_reports ADD COLUMN content_signature TEXT")
+        # 재개 가능 인제스트(B) — 청크 단위 진행 마커. 크래시로 중단되면 done_chunks까지가 완료로 남아,
+        # 재실행 시 같은 source_id로 그 지점부터 이어받는다(완료 청크 재추출 방지, implementation_plan.md ③).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingest_progress (
+                collection    TEXT NOT NULL,
+                file_name     TEXT NOT NULL,
+                source_id     TEXT NOT NULL,
+                content_hash  TEXT NOT NULL,
+                total_chunks  INTEGER NOT NULL,
+                done_chunks   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (collection, file_name)
+            )
+            """
+        )
 
 
 # 컬렉션+파일명으로 저장된 마지막 content_hash를 조회한다 (없으면 None).
@@ -645,3 +660,60 @@ def get_community_reports(collection: str, level: int | None = None) -> list[dic
 def delete_community_reports_by_collection(collection: str) -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM community_reports WHERE collection = ?", (collection,))
+
+
+# --- B: 재개 가능 인제스트(ingest_progress) ---
+
+
+# 문서의 진행 마커를 새로 쓰거나 갱신한다(재처리 시작 시 1회, done_chunks=0으로).
+def upsert_ingest_progress(
+    collection: str, file_name: str, source_id: str, content_hash: str,
+    total_chunks: int, done_chunks: int = 0,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            REPLACE INTO ingest_progress
+                (collection, file_name, source_id, content_hash, total_chunks, done_chunks)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (collection, file_name, source_id, content_hash, total_chunks, done_chunks),
+        )
+
+
+# 문서의 진행 마커를 조회한다(없으면 None).
+def get_ingest_progress(collection: str, file_name: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT source_id, content_hash, total_chunks, done_chunks "
+            "FROM ingest_progress WHERE collection = ? AND file_name = ?",
+            (collection, file_name),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"source_id": row[0], "content_hash": row[1], "total_chunks": row[2], "done_chunks": row[3]}
+
+
+# 청크 하나가 성공적으로 저장될 때마다 진행 마커를 갱신한다(durable 마커 — 크래시 시 여기까지가 완료로 인정됨).
+def set_ingest_progress_done(collection: str, file_name: str, done_chunks: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE ingest_progress SET done_chunks = ? WHERE collection = ? AND file_name = ?",
+            (done_chunks, collection, file_name),
+        )
+
+
+# 문서 처리가 끝까지 성공(commit_document)한 뒤에만 진행 마커를 지운다.
+def delete_ingest_progress(collection: str, file_name: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM ingest_progress WHERE collection = ? AND file_name = ?", (collection, file_name)
+        )
+
+
+# 현재 진행 중(미완료)인 모든 source_id를 가져온다 — 고아 정리가 크래시 직후의 부분 데이터를
+# 삭제하지 않도록 보호하는 데 쓴다(아직 documents에 없지만 고아도 아닌 상태, implementation_plan.md ③-2).
+def get_inflight_source_ids() -> set[str]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT source_id FROM ingest_progress").fetchall()
+    return {row[0] for row in rows}

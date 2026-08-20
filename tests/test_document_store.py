@@ -345,6 +345,23 @@ def test_delete_collection_removes_desc_candidates_scoped_to_that_collection(mon
     assert sqlite_manager.get_desc_candidates("사업B", "이대리") == ["B쪽 설명"]
 
 
+def test_find_orphaned_source_ids_protects_inflight_ingest_progress(monkeypatch):
+    # 재개 가능 인제스트(B) 진행 중(in-flight)인 source_id는 아직 documents에 없어도 고아로 잡히면 안
+    # 된다 — 크래시와 재개 사이에 cleanup이 돌 때 부분 데이터를 지우면 안 된다(implementation_plan.md ③ 정합성 2).
+    sqlite_manager.init_schema()
+    graph_manager.init_schema()
+    monkeypatch.setattr("db.vector_manager.embed_texts", lambda texts: [[0.0, 0.0] for _ in texts])
+
+    vector_manager.add_chunks("doc_inflight", ["청크 내용"], C)
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_inflight", "hash1", total_chunks=3, done_chunks=1)
+
+    assert document_store.find_orphaned_source_ids() == set()  # 보호됨
+
+    # 정상 완료(커밋 + 진행 마커 삭제)되면 더는 보호 대상이 아니다 — 이후엔 정상적으로 고아 판정 대상.
+    sqlite_manager.delete_ingest_progress(C, "memo.md")
+    assert document_store.find_orphaned_source_ids() == {"doc_inflight"}
+
+
 def test_cleanup_orphaned_data_removes_orphaned_desc_candidates():
     # 처리 중간에 끊겨 문서 기록이 없는 source_id의 설명 후보도 고아 정리 대상이어야 한다.
     sqlite_manager.init_schema()

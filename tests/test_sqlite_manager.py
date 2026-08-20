@@ -382,3 +382,58 @@ def test_community_reports_are_collection_scoped_and_cascade_delete():
 
     assert sqlite_manager.get_community_reports("사업A") == []
     assert len(sqlite_manager.get_community_reports("사업B")) == 1
+
+
+# --- B: 재개 가능 인제스트(ingest_progress) — implementation_plan.md ③ ---
+
+
+def test_ingest_progress_roundtrip():
+    sqlite_manager.init_schema()
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") is None
+
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_1", "hash1", total_chunks=5, done_chunks=0)
+
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") == {
+        "source_id": "doc_1", "content_hash": "hash1", "total_chunks": 5, "done_chunks": 0,
+    }
+
+
+def test_set_ingest_progress_done_updates_only_done_chunks():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_1", "hash1", total_chunks=5, done_chunks=0)
+
+    sqlite_manager.set_ingest_progress_done(C, "memo.md", 3)
+
+    progress = sqlite_manager.get_ingest_progress(C, "memo.md")
+    assert progress["done_chunks"] == 3
+    assert progress["total_chunks"] == 5  # 다른 필드는 그대로
+
+
+def test_delete_ingest_progress_removes_row():
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_1", "hash1", total_chunks=5, done_chunks=5)
+
+    sqlite_manager.delete_ingest_progress(C, "memo.md")
+
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") is None
+
+
+def test_upsert_ingest_progress_same_key_replaces_not_accumulates():
+    # (collection, file_name)이 PK — 재시작 시 옛 진행 행을 덮어써야지, 별도 행으로 쌓이면 안 된다.
+    sqlite_manager.init_schema()
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_1", "hash1", total_chunks=5, done_chunks=2)
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_2", "hash2", total_chunks=8, done_chunks=0)
+
+    assert sqlite_manager.get_ingest_progress(C, "memo.md") == {
+        "source_id": "doc_2", "content_hash": "hash2", "total_chunks": 8, "done_chunks": 0,
+    }
+
+
+def test_get_inflight_source_ids():
+    sqlite_manager.init_schema()
+    assert sqlite_manager.get_inflight_source_ids() == set()
+
+    sqlite_manager.upsert_ingest_progress(C, "memo.md", "doc_1", "hash1", total_chunks=5, done_chunks=2)
+    sqlite_manager.upsert_ingest_progress("사업A", "report.md", "doc_2", "hash2", total_chunks=3, done_chunks=0)
+
+    assert sqlite_manager.get_inflight_source_ids() == {"doc_1", "doc_2"}

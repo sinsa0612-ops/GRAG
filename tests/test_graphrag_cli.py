@@ -88,6 +88,29 @@ def test_cli_ingest_backend_flag_threads_to_process_file(tmp_path, monkeypatch):
     assert seen["backend"] == "ollama"  # 플래그 없으면 설정 기본값(ingest_backend=ollama, 완전 로컬)
 
 
+def test_cli_ingest_profile_flag_threads_to_process_file(tmp_path, monkeypatch):
+    # --profile fast가 process_file까지 그대로 전달되고, 미지정이면 None으로 전달돼 process_file 내부에서
+    # config 기본값(quality)으로 해소되는지 확인한다(implementation_plan.md ②).
+    monkeypatch.setattr(settings, "project_root", tmp_path)
+    seen = {}
+
+    def spy_process_file(path, collection, *, glean_rounds=None, backend=None, extraction_mode=None, profile=None):
+        seen["profile"] = profile
+        return True
+
+    monkeypatch.setattr(ingest, "process_file", spy_process_file)
+    graphrag_cli.main(["init"])
+    memo = tmp_path / "memo.md"
+    memo.write_text("아무 메모", encoding="utf-8")
+
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A", "--profile", "fast"])
+    assert seen["profile"] == "fast"
+
+    memo.write_text("아무 메모2", encoding="utf-8")  # 해시가 달라야 재처리됨
+    graphrag_cli.main(["ingest", str(memo), "--collection", "사업A"])
+    assert seen["profile"] is None  # 플래그 없으면 None 그대로(config 기본값은 process_file 내부에서 해소)
+
+
 def test_cli_delete_collection_clears_it(tmp_path, monkeypatch, capsys):
     # 잘못 넣은 컬렉션을 delete-collection으로 통째 비우면 엔티티가 사라져야 한다(롤백 용도).
     monkeypatch.setattr(settings, "project_root", tmp_path)

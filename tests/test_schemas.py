@@ -54,3 +54,17 @@ def test_predicate_is_normalized_to_upper_snake_case():
 def test_predicate_normalizes_hyphen_and_surrounding_space():
     rel = ExtractedRelation(source="A", target="B", predicate="  Located-In  ")
     assert rel.predicate == "LOCATED_IN"
+
+
+def test_extracted_entity_accepts_and_cleans_aliases():
+    # coreference(implementation_plan.md 과제1): 빈/비문자열·자기자신(name과 동일)·중복 원소는 정리된다.
+    entity = ExtractedEntity(
+        name="장인", aliases=["빙장", "", "장인", "봉필씨", "빙장", "  "], type="PERSON"
+    )
+    assert entity.aliases == ["빙장", "봉필씨"]  # 순서 보존, "장인"(자기자신)·빈값·중복 제거
+
+
+def test_extracted_entity_aliases_default_to_empty_list():
+    # default_factory라 기존 호출부(aliases 미지정)는 그대로 하위호환으로 동작해야 한다.
+    entity = ExtractedEntity(name="강택리", type="PERSON")
+    assert entity.aliases == []

@@ -33,3 +33,21 @@ def test_count_chunks_respects_collection_scope(monkeypatch):
     assert vector_manager.count_chunks(["c1"]) == 2
     assert vector_manager.count_chunks(["c2"]) == 1
     assert vector_manager.count_chunks(["c1", "c2"]) == 3
+
+
+def test_add_chunks_is_idempotent_on_reingest_with_same_source_id(monkeypatch):
+    # 재개 가능 인제스트(B)가 크래시 후 같은 source_id로 add_chunks를 다시 호출한다(청크 id가 이미 존재).
+    # 카운트만으로는 add/upsert를 구분 못 한다 — 이 chromadb 버전의 add()는 중복 id를 에러 없이 '조용히
+    # 무시'해 옛 내용을 그대로 남기므로(실측 확인), upsert의 증거는 내용이 실제로 최신으로 갱신되는지로
+    # 확인해야 한다(implementation_plan.md ③ 정합성 1 — 재개 시 재add해도 최신 내용을 반영해야 함).
+    monkeypatch.setattr("db.vector_manager.embed_texts", _fake_embed_texts)
+
+    vector_manager.add_chunks("doc_1", ["청크 A", "청크 B"], "c1")
+    assert vector_manager.count_chunks() == 2
+
+    vector_manager.add_chunks("doc_1", ["갱신된 청크 A", "갱신된 청크 B"], "c1")  # 같은 source_id로 재호출(재개 시나리오)
+
+    assert vector_manager.count_chunks() == 2  # 청크 수가 늘어나지 않음(중복 id)
+    collection = vector_manager._get_collection()
+    stored = collection.get(ids=["doc_1_chunk_0", "doc_1_chunk_1"], include=["documents"])
+    assert set(stored["documents"]) == {"갱신된 청크 A", "갱신된 청크 B"}  # upsert라서 최신 내용으로 갱신됨
